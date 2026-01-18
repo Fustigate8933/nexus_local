@@ -3,7 +3,8 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, TextExtractor, Embedder, IndexEvent};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor};
+use ocr::{PlainTextExtractor, OcrEngine};
 use std::path::PathBuf;
 use async_trait::async_trait;
 
@@ -35,11 +36,13 @@ enum Commands {
     },
 }
 
-struct DummyExtractor;
+/// Wrapper to adapt PlainTextExtractor (OcrEngine) to TextExtractor trait.
+struct OcrExtractor(PlainTextExtractor);
+
 #[async_trait]
-impl TextExtractor for DummyExtractor {
-    async fn extract_text(&self, _path: &PathBuf) -> anyhow::Result<String> {
-        Ok("dummy text".to_string())
+impl TextExtractor for OcrExtractor {
+    async fn extract_text(&self, path: &PathBuf) -> anyhow::Result<String> {
+        self.0.extract_text(path).await
     }
 }
 
@@ -60,7 +63,7 @@ async fn main() -> Result<()> {
         Commands::Index { path } => {
             println!("Indexing directory: {}", path);
             let options = IndexOptions { root: PathBuf::from(path) };
-            let extractor = DummyExtractor;
+            let extractor = OcrExtractor(PlainTextExtractor);
             let embedder = DummyEmbedder;
             let mut indexer = Indexer::new(options, extractor, embedder);
             let mut events = Vec::new();

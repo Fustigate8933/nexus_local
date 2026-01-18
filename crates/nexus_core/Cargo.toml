@@ -8,7 +8,10 @@ anyhow = "1.0"
 async-trait = "0.1"
 futures = "0.3"
 walkdir = "2.4"
+ocr = { path = "../ocr" }
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }
 async-trait = "0.1"
+ocr = { path = "../ocr" }
+embed = { path = "../embed" }

@@ -7,6 +7,9 @@ use std::fs;
 use async_trait::async_trait;
 use anyhow::Result;
 
+use leptess::LepTess;
+use poppler::PopplerDocument;
+
 /// Trait for OCR text extraction from images or PDFs.
 #[async_trait]
 pub trait OcrEngine: Send + Sync {
@@ -25,7 +28,24 @@ impl OcrEngine for PlainTextExtractor {
 				let text = fs::read_to_string(path)?;
 				Ok(text)
 			}
-			// TODO: Add PDF/image OCR support here
+			"png" | "jpg" | "jpeg" => {
+				let mut lt = LepTess::new(None, "eng")?;
+				lt.set_image(path);
+				let text = lt.get_utf8_text()?;
+				Ok(text)
+			}
+			"pdf" => {
+				let mut data = fs::read(path)?;
+				let doc = PopplerDocument::new_from_data(&mut data, None).map_err(|e| anyhow::anyhow!("Failed to open PDF: {:?}", e))?;
+				let mut text = String::new();
+				for page in doc.pages() {
+					if let Some(page_text) = page.get_text() {
+						text.push_str(page_text);
+						text.push_str("\n");
+					}
+				}
+				Ok(text)
+			}
 			_ => Ok(String::new()),
 		}
 	}

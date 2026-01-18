@@ -59,32 +59,35 @@ impl<E: TextExtractor, M: Embedder> Indexer<E, M> {
 		let mut errors = vec![];
 
 		let files = discover_files(&self.options.root)?;
-		let mut stream = stream::iter(files)
-			.map(|path| async move {
-				(path.clone(), fs::read_to_string(&path))
-			})
-			.buffer_unordered(4);
+			   let mut stream = stream::iter(files)
+				   .map(|path| {
+					   let extractor = &self.extractor;
+					   async move {
+						   (path.clone(), extractor.extract_text(&path).await)
+					   }
+				   })
+				   .buffer_unordered(4);
 
-		while let Some((path, res)) = stream.next().await {
-			cb(IndexEvent::FileStarted(path.clone()));
-			match res {
-				Ok(contents) => {
-					files_indexed += 1;
-					let chunks = chunk_text(&contents, 512);
-					for (i, _chunk) in chunks.iter().enumerate() {
-						chunks_indexed += 1;
-						cb(IndexEvent::ChunkProcessed(path.clone(), i));
-						// TODO: Call embedder and store
-					}
-					cb(IndexEvent::FileIndexed(path));
-				}
-				Err(ref e) => {
-					let err_str = format!("{}", e);
-					cb(IndexEvent::FileError(path.clone(), err_str.clone()));
-					errors.push((path, err_str));
-				}
-			}
-		}
+			   while let Some((path, res)) = stream.next().await {
+				   cb(IndexEvent::FileStarted(path.clone()));
+				   match res {
+					   Ok(contents) => {
+						   files_indexed += 1;
+						   let chunks = chunk_text(&contents, 512);
+						   for (i, _chunk) in chunks.iter().enumerate() {
+							   chunks_indexed += 1;
+							   cb(IndexEvent::ChunkProcessed(path.clone(), i));
+							   // TODO: Call embedder and store
+						   }
+						   cb(IndexEvent::FileIndexed(path));
+					   }
+					   Err(ref e) => {
+						   let err_str = format!("{}", e);
+						   cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+						   errors.push((path, err_str));
+					   }
+				   }
+			   }
 		cb(IndexEvent::Done);
 		Ok(IndexResult {
 			files_indexed,

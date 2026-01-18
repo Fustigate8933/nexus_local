@@ -1,3 +1,4 @@
+poppler = "0.16"
 [package]
 name = "ocr"
 version = "0.1.0"
@@ -6,6 +7,8 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+leptess = "0.14"
+poppler = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }
