@@ -1,0 +1,30 @@
+# Rust/Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Byproducts
+*.swp
+*.swo
+*.tmp
+
+# Test output
+/coverage/
+
+# Python (if any scripts)
+__pycache__/
+*.pyc
+
+# Misc
+*.bak
+.idea/

@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/ocr",
+    "crates/embed",
+    "crates/store",
+    "crates/search",
+    "crates/cli"
+]
+
+# TODO: Add common workspace dependencies here (tokio, anyhow, thiserror, etc.)
