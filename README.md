@@ -1,6 +1,6 @@
 # Nexus Local
 
-Local-first, privacy-preserving second brain
+Local-first, privacy-preserving second brain for your computer.
 
 ## Crates
 - core: Indexing pipeline, chunking, orchestration
