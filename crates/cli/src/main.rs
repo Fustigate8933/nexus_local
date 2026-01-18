@@ -1,7 +1,11 @@
 //! CLI entrypoint for Nexus Local.
 
+
 use clap::{Parser, Subcommand};
 use anyhow::Result;
+use nexus_core::{IndexOptions, Indexer, TextExtractor, Embedder, IndexEvent};
+use std::path::PathBuf;
+use async_trait::async_trait;
 
 #[derive(Parser)]
 #[command(name = "nexus")]
@@ -31,6 +35,22 @@ enum Commands {
     },
 }
 
+struct DummyExtractor;
+#[async_trait]
+impl TextExtractor for DummyExtractor {
+    async fn extract_text(&self, _path: &PathBuf) -> anyhow::Result<String> {
+        Ok("dummy text".to_string())
+    }
+}
+
+struct DummyEmbedder;
+#[async_trait]
+impl Embedder for DummyEmbedder {
+    async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(vec![0.0, 1.0, 2.0])
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -39,19 +59,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Index { path } => {
             println!("Indexing directory: {}", path);
-            // TODO: Call core indexing logic
+            let options = IndexOptions { root: PathBuf::from(path) };
+            let extractor = DummyExtractor;
+            let embedder = DummyEmbedder;
+            let mut indexer = Indexer::new(options, extractor, embedder);
+            let mut events = Vec::new();
+            let result = indexer.run_with_progress(|e| {
+                println!("Event: {:?}", e);
+                events.push(e);
+            }).await?;
+            println!("Indexed {} files, {} chunks, {} errors", result.files_indexed, result.chunks_indexed, result.errors.len());
         }
         Commands::Status => {
             println!("Indexer/search status: (stub)");
-            // TODO: Show status
         }
         Commands::Search { query, json } => {
             println!("Searching for: {} (json: {})", query, json);
-            // TODO: Call search logic
         }
         Commands::Explain { doc_id } => {
             println!("Explaining document: {}", doc_id);
-            // TODO: Call explain logic
         }
     }
     Ok(())

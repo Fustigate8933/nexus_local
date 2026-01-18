@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# TODO: Add dependencies (tantivy, etc.)
+anyhow = "1.0"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.37", features = ["full"] }
