@@ -519,7 +519,46 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 /// Recursively discover supported files in a directory.
 fn discover_files(root: &PathBuf, skip_extensions: &[String], skip_files: &[String]) -> Result<Vec<PathBuf>> {
 	let mut files = Vec::new();
-	let supported = ["txt", "md", "pdf", "png", "jpg", "jpeg"];
+	
+	// Text-based extensions (code, config, docs)
+	let text_extensions: std::collections::HashSet<&str> = [
+		// Documents
+		"txt", "md", "markdown", "rst", "org", "tex", "rtf",
+		// Programming languages
+		"py", "rs", "js", "ts", "jsx", "tsx", "cpp", "c", "h", "hpp", "cc", "cxx",
+		"go", "java", "kt", "kts", "scala", "rb", "php", "swift", "m", "mm",
+		"cs", "fs", "vb", "r", "lua", "pl", "pm", "tcl", "zig", "nim", "d",
+		"hs", "ml", "mli", "ex", "exs", "erl", "hrl", "clj", "cljs", "lisp", "el",
+		"v", "sv", "vhd", "vhdl", "asm", "s",
+		// Shell/scripts
+		"sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
+		// Config/data
+		"json", "yaml", "yml", "toml", "xml", "ini", "cfg", "conf", "config",
+		"env", "properties", "plist",
+		// Web
+		"html", "htm", "css", "scss", "sass", "less", "svg",
+		// Database/query
+		"sql", "graphql", "gql",
+		// Build/CI
+		"cmake", "make", "gradle", "sbt", "cabal",
+		// Other
+		"csv", "tsv", "log", "diff", "patch",
+		// Binary/Office formats with text extraction
+		"pdf", "png", "jpg", "jpeg",
+		"docx", "xlsx", "pptx",  // Microsoft Office
+		"odt", "odp",            // OpenDocument (no ods support yet)
+	].into_iter().collect();
+	
+	// Known text filenames (no extension)
+	let text_filenames: std::collections::HashSet<&str> = [
+		"Makefile", "makefile", "GNUmakefile",
+		"Dockerfile", "dockerfile", "Containerfile",
+		"Vagrantfile", "Gemfile", "Rakefile",
+		"LICENSE", "LICENCE", "COPYING",
+		"README", "CHANGELOG", "HISTORY", "AUTHORS", "CONTRIBUTORS",
+		"TODO", "NOTES", "INSTALL", "NEWS",
+	].into_iter().collect();
+	
 	for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
 		let path = entry.path();
 		if path.is_file() {
@@ -528,14 +567,21 @@ fn discover_files(root: &PathBuf, skip_extensions: &[String], skip_files: &[Stri
 				if skip_files.iter().any(|pattern| filename.contains(pattern)) {
 					continue;
 				}
+				
+				// Check for known text filenames (no extension)
+				if text_filenames.contains(filename) {
+					files.push(path.to_path_buf());
+					continue;
+				}
 			}
+			
 			if let Some(ext) = path.extension().and_then(OsStr::to_str) {
 				let ext_lower = ext.to_lowercase();
 				// Skip if extension in skip list
 				if skip_extensions.iter().any(|s| s.to_lowercase() == ext_lower) {
 					continue;
 				}
-				if supported.contains(&ext_lower.as_str()) {
+				if text_extensions.contains(ext_lower.as_str()) {
 					files.push(path.to_path_buf());
 				}
 			}
