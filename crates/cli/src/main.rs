@@ -6,7 +6,7 @@ use anyhow::Result;
 use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor, VectorStore};
 use ocr::{PlainTextExtractor, OcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
-use store::LanceVectorStore;
+use store::{LanceVectorStore, StateManager};
 use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -99,8 +99,12 @@ async fn main() -> Result<()> {
             eprintln!("info: model loaded (dim={})", embedder.dimension());
 
             eprintln!("info: opening store at {:?}", data_dir);
-            let store = Arc::new(LanceVectorStore::new(data_dir).await?);
+            let store = Arc::new(LanceVectorStore::new(data_dir.clone()).await?);
             eprintln!("info: {} existing embeddings", store.count().await);
+
+            // Initialize state manager
+            let state = Arc::new(StateManager::new(&data_dir)?);
+            eprintln!("info: state manager ready");
 
             let options = IndexOptions { 
                 root: PathBuf::from(&path), 
@@ -110,13 +114,27 @@ async fn main() -> Result<()> {
             };
             let extractor = OcrExtractor(PlainTextExtractor);
             let embedder = EmbedWrapper(embedder);
-            let mut indexer = Indexer::new(options, extractor, embedder, store.clone());
+            let indexer = Indexer::new(options, extractor, embedder, store.clone())
+                .with_state(state);
 
+            // Run garbage collection first to clean up stale embeddings
+            eprintln!("info: running garbage collection...");
+            let gc_result = indexer.garbage_collect().await?;
+            if gc_result.embeddings_removed > 0 {
+                eprintln!("  gc: removed {} embeddings ({} deleted files, {} modified files)",
+                    gc_result.embeddings_removed,
+                    gc_result.deleted_files,
+                    gc_result.modified_files
+                );
+            }
+
+            let mut indexer = indexer; // Make mutable for run_with_progress
             let result = indexer.run_with_progress(|e| {
                 match &e {
                     IndexEvent::FileStarted(p) => eprintln!("  processing {}", p.display()),
                     IndexEvent::FileIndexed(p) => eprintln!("  indexed {}", p.display()),
                     IndexEvent::FileSkipped(p, reason) => eprintln!("  skipped {} ({})", p.display(), reason),
+                    IndexEvent::FileUnchanged(p) => eprintln!("  unchanged {}", p.display()),
                     IndexEvent::ChunkEmbedded(_, i, id) => eprintln!("    chunk {} -> {}", i, &id[..8]),
                     IndexEvent::FileError(p, err) => eprintln!("  error: {} - {}", p.display(), err),
                     IndexEvent::Done => {},
@@ -124,8 +142,9 @@ async fn main() -> Result<()> {
                 }
             }).await?;
 
-            eprintln!("done: {} indexed, {} skipped, {} chunks, {} embeddings, {} errors",
+            eprintln!("done: {} indexed, {} unchanged, {} skipped, {} chunks, {} embeddings, {} errors",
                 result.files_indexed,
+                result.files_unchanged,
                 result.files_skipped,
                 result.chunks_indexed,
                 result.embeddings_stored,

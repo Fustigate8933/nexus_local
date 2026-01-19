@@ -3,6 +3,9 @@
 //! Uses LanceDB for disk-based vector storage with ANN indexing.
 //! Scales to millions of embeddings without loading everything into RAM.
 
+mod state;
+pub use state::{StateManager, FileState, FileInfo};
+
 use async_trait::async_trait;
 use anyhow::{Result, Context};
 use std::path::PathBuf;
@@ -46,6 +49,7 @@ pub trait VectorStore: Send + Sync {
     async fn add_embedding(&self, embedding: Vec<f32>, metadata: DocumentMetadata) -> Result<String>;
     async fn search(&self, query: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>>;
     async fn get_metadata(&self, doc_id: &str) -> Result<Option<DocumentMetadata>>;
+    async fn delete_by_doc_ids(&self, doc_ids: &[String]) -> Result<usize>;
     async fn save(&self) -> Result<()>;
     async fn count(&self) -> usize;
 }
@@ -303,6 +307,33 @@ impl VectorStore for LanceVectorStore {
             None => 0,
         }
     }
+
+    async fn delete_by_doc_ids(&self, doc_ids: &[String]) -> Result<usize> {
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let table_guard = self.table.read().await;
+        
+        let table = match &*table_guard {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        let count_before = table.count_rows(None).await.unwrap_or(0) as usize;
+
+        // Build filter: doc_id IN ('id1', 'id2', ...)
+        let escaped_ids: Vec<String> = doc_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let filter = format!("doc_id IN ({})", escaped_ids.join(", "));
+
+        table.delete(&filter).await?;
+
+        let count_after = table.count_rows(None).await.unwrap_or(0) as usize;
+        Ok(count_before.saturating_sub(count_after))
+    }
 }
 
 // Stub implementation for testing without persistence
@@ -328,6 +359,10 @@ impl VectorStore for DummyStore {
 
     async fn count(&self) -> usize {
         0
+    }
+
+    async fn delete_by_doc_ids(&self, _doc_ids: &[String]) -> Result<usize> {
+        Ok(0)
     }
 }
 

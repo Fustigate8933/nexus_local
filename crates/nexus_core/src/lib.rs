@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use anyhow::Result;
 use std::ffi::OsStr;
-pub use store::{VectorStore, DocumentMetadata, SearchResult};
+pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState};
 
 /// Options for configuring the indexer.
 pub struct IndexOptions {
@@ -37,6 +37,7 @@ pub enum IndexEvent {
 	FileIndexed(PathBuf),
 	FileError(PathBuf, String),
 	FileSkipped(PathBuf, String),
+	FileUnchanged(PathBuf), // File already indexed and not modified
 	ChunkProcessed(PathBuf, usize),
 	ChunkEmbedded(PathBuf, usize, String), // path, chunk_index, doc_id
 	Done,
@@ -46,9 +47,21 @@ pub enum IndexEvent {
 pub struct IndexResult {
 	pub files_indexed: usize,
 	pub files_skipped: usize,
+	pub files_unchanged: usize,
 	pub chunks_indexed: usize,
 	pub embeddings_stored: usize,
 	pub errors: Vec<(PathBuf, String)>,
+}
+
+/// Result of garbage collection.
+#[derive(Debug, Default)]
+pub struct GcResult {
+	/// Number of deleted files cleaned up
+	pub deleted_files: usize,
+	/// Number of modified files with old embeddings cleaned up
+	pub modified_files: usize,
+	/// Total embeddings removed from store
+	pub embeddings_removed: usize,
 }
 
 /// Main orchestrator for the indexing pipeline.
@@ -57,16 +70,57 @@ pub struct Indexer<E: TextExtractor, M: Embedder, S: VectorStore> {
 	extractor: E,
 	embedder: M,
 	store: Arc<S>,
+	state: Option<Arc<StateManager>>,
 }
 
 impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	pub fn new(options: IndexOptions, extractor: E, embedder: M, store: Arc<S>) -> Self {
-		Self { options, extractor, embedder, store }
+		Self { options, extractor, embedder, store, state: None }
+	}
+	
+	/// Set the state manager for incremental indexing.
+	pub fn with_state(mut self, state: Arc<StateManager>) -> Self {
+		self.state = Some(state);
+		self
 	}
 
 	/// Run the indexing pipeline (no progress reporting).
 	pub async fn run(&mut self) -> Result<IndexResult> {
 		self.run_with_progress(|_| ()).await
+	}
+
+	/// Run garbage collection to remove embeddings for deleted or modified files.
+	/// This should be called before indexing to clean up stale data.
+	pub async fn garbage_collect(&self) -> Result<GcResult> {
+		let state = match &self.state {
+			Some(s) => s,
+			None => return Ok(GcResult::default()),
+		};
+
+		let mut result = GcResult::default();
+
+		// 1. Clean up embeddings for deleted files
+		let deleted_files = state.get_deleted_files()?;
+		for path in &deleted_files {
+			let doc_ids = state.remove_file(path)?;
+			if !doc_ids.is_empty() {
+				let removed = self.store.delete_by_doc_ids(&doc_ids).await?;
+				result.embeddings_removed += removed;
+				result.deleted_files += 1;
+			}
+		}
+
+		// 2. Clean up old embeddings for modified files (they'll be re-indexed)
+		let all_files = state.get_all_files()?;
+		for file_info in all_files {
+			if file_info.file_state == FileState::Modified && !file_info.doc_ids.is_empty() {
+				let removed = self.store.delete_by_doc_ids(&file_info.doc_ids).await?;
+				result.embeddings_removed += removed;
+				result.modified_files += 1;
+			}
+		}
+
+		Ok(result)
 	}
 
 	/// Run the indexing pipeline, reporting progress via callback.
@@ -76,6 +130,7 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	{
 		let mut files_indexed = 0;
 		let mut files_skipped = 0;
+		let mut files_unchanged = 0;
 		let mut chunks_indexed = 0;
 		let mut embeddings_stored = 0;
 		let mut errors = vec![];
@@ -97,13 +152,31 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 					continue;
 				}
 			}
+			
+			// Check if file needs indexing (using state manager if available)
+			if let Some(ref state) = self.state {
+				match state.needs_indexing(&path) {
+					Ok(false) => {
+						cb(IndexEvent::FileUnchanged(path.clone()));
+						files_unchanged += 1;
+						continue;
+					}
+					Ok(true) => {
+						// File needs indexing, continue
+					}
+					Err(e) => {
+						// State check failed, index anyway
+						eprintln!("  warning: state check failed for {}: {}", path.display(), e);
+					}
+				}
+			}
 
 			cb(IndexEvent::FileStarted(path.clone()));
 
 			match self.extractor.extract_text(&path).await {
 				Ok(contents) => {
-					files_indexed += 1;
 					let chunks = chunk_text(&contents, chunk_size);
+					let mut file_doc_ids: Vec<String> = Vec::new();
 
 					// Batch embed for efficiency
 					if !chunks.is_empty() {
@@ -139,6 +212,7 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 									match self.store.add_embedding(embedding, metadata).await {
 										Ok(doc_id) => {
 											embeddings_stored += 1;
+											file_doc_ids.push(doc_id.clone());
 											cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id));
 										}
 										Err(e) => {
@@ -156,6 +230,21 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 							}
 						}
 					}
+					
+					// Mark file as indexed in state manager
+					if !file_doc_ids.is_empty() {
+						if let Some(ref state) = self.state {
+							if let Ok(meta) = std::fs::metadata(&path) {
+								if let Ok(mtime) = meta.modified() {
+									if let Err(e) = state.mark_indexed(&path, mtime, &file_doc_ids) {
+										eprintln!("  warning: failed to update state for {}: {}", path.display(), e);
+									}
+								}
+							}
+						}
+						files_indexed += 1;
+					}
+					
 					cb(IndexEvent::FileIndexed(path));
 				}
 				Err(ref e) => {
@@ -173,6 +262,7 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 		Ok(IndexResult {
 			files_indexed,
 			files_skipped,
+			files_unchanged,
 			chunks_indexed,
 			embeddings_stored,
 			errors,
