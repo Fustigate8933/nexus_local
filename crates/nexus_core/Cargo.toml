@@ -8,6 +8,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 futures = "0.3"
 walkdir = "2.4"
+sysinfo = "0.32"
 ocr = { path = "../ocr" }
 store = { path = "../store" }
 

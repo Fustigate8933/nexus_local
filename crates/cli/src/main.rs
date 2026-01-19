@@ -129,12 +129,17 @@ async fn main() -> Result<()> {
             }
 
             let mut indexer = indexer; // Make mutable for run_with_progress
+            let mut memory_skipped = 0usize;
             let result = indexer.run_with_progress(|e| {
                 match &e {
                     IndexEvent::FileStarted(p) => eprintln!("  processing {}", p.display()),
                     IndexEvent::FileIndexed(p) => eprintln!("  indexed {}", p.display()),
+                    IndexEvent::FileSkipped(_, reason) if reason.contains("memory pressure") => {
+                        memory_skipped += 1;
+                    }
                     IndexEvent::FileSkipped(p, reason) => eprintln!("  skipped {} ({})", p.display(), reason),
                     IndexEvent::FileUnchanged(p) => eprintln!("  unchanged {}", p.display()),
+                    IndexEvent::MemoryPressure(_, _) => {} // Handled via FileSkipped
                     IndexEvent::ChunkEmbedded(_, i, id) => eprintln!("    chunk {} -> {}", i, &id[..8]),
                     IndexEvent::FileError(p, err) => eprintln!("  error: {} - {}", p.display(), err),
                     IndexEvent::Done => {},
@@ -150,6 +155,10 @@ async fn main() -> Result<()> {
                 result.embeddings_stored,
                 result.errors.len()
             );
+            if memory_skipped > 0 {
+                eprintln!("warning: {} files skipped due to memory pressure", memory_skipped);
+                eprintln!("  hint: increase limit with --max-memory-mb or re-run later");
+            }
             eprintln!("info: total embeddings in store: {}", store.count().await);
         }
         Commands::Status => {

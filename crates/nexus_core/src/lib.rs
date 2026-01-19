@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use anyhow::Result;
 use std::ffi::OsStr;
+use sysinfo::System;
 pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState};
 
 /// Options for configuring the indexer.
@@ -38,6 +39,7 @@ pub enum IndexEvent {
 	FileError(PathBuf, String),
 	FileSkipped(PathBuf, String),
 	FileUnchanged(PathBuf), // File already indexed and not modified
+	MemoryPressure(u64, u64), // (used_mb, limit_mb) - pausing due to memory pressure
 	ChunkProcessed(PathBuf, usize),
 	ChunkEmbedded(PathBuf, usize, String), // path, chunk_index, doc_id
 	Done,
@@ -138,9 +140,26 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 		let files = discover_files(&self.options.root)?;
 		let chunk_size = self.options.chunk_size;
 		let max_file_size = self.options.max_file_size_bytes;
+		let max_memory = self.options.max_memory_bytes;
+
+		// System info for memory monitoring
+		let mut sys = System::new();
 
 		// Process files sequentially to allow mutable borrow of embedder
 		for path in files {
+			// Memory throttling: skip file if memory usage exceeds limit
+			sys.refresh_memory();
+			let used_mem = sys.used_memory(); // bytes
+			if used_mem > max_memory {
+				let used_mb = used_mem / 1024 / 1024;
+				let limit_mb = max_memory / 1024 / 1024;
+				cb(IndexEvent::MemoryPressure(used_mb, limit_mb));
+				let reason = format!("memory pressure ({}MB > {}MB limit)", used_mb, limit_mb);
+				cb(IndexEvent::FileSkipped(path.clone(), reason));
+				files_skipped += 1;
+				continue;
+			}
+
 			// Check file size before processing
 			if let Ok(metadata) = std::fs::metadata(&path) {
 				if metadata.len() > max_file_size {
