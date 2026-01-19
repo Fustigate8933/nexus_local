@@ -9,6 +9,7 @@ async-trait = "0.1"
 futures = "0.3"
 walkdir = "2.4"
 ocr = { path = "../ocr" }
+store = { path = "../store" }
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }
