@@ -6,7 +6,7 @@ use anyhow::Result;
 use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor, VectorStore};
 use ocr::{PlainTextExtractor, OcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
-use store::LocalVectorStore;
+use store::LanceVectorStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             eprintln!("info: model loaded (dim={})", embedder.dimension());
 
             eprintln!("info: opening store at {:?}", data_dir);
-            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+            let store = Arc::new(LanceVectorStore::new(data_dir).await?);
             eprintln!("info: {} existing embeddings", store.count().await);
 
             let options = IndexOptions { 
@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let store = Arc::new(LocalVectorStore::new(data_dir.clone())?);
+            let store = Arc::new(LanceVectorStore::new(data_dir.clone()).await?);
             let count = store.count().await;
             println!("nexus status");
             println!("  store: {:?}", data_dir);
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 
             // Load embedder and store
             let embedder = LocalEmbedder::new()?;
-            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+            let store = Arc::new(LanceVectorStore::new(data_dir).await?);
 
             // Embed the query
             let query_embedding = embedder.embed(&query).await?;
@@ -221,15 +221,15 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+            let store = Arc::new(LanceVectorStore::new(data_dir).await?);
 
             // Find matching documents (partial ID match)
-            if let Some(metadata) = store.get_metadata(&doc_id).await? {
+            if let Some(meta) = store.get_metadata(&doc_id).await? {
                 println!("document: {}", doc_id);
-                println!("  path: {}", metadata.file_path.display());
-                println!("  type: {}", metadata.file_type);
-                println!("  chunk: {}", metadata.chunk_index);
-                if let Some(snippet) = &metadata.snippet {
+                println!("  path: {}", meta.file_path.display());
+                println!("  type: {}", meta.file_type);
+                println!("  chunk: {}", meta.chunk_index);
+                if let Some(snippet) = &meta.snippet {
                     println!("  content:");
                     for line in snippet.lines() {
                         println!("    {}", line);
