@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::ffi::OsStr;
 use sysinfo::System;
 use rayon::prelude::*;
-pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState};
+pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState, LexicalIndex, LexicalDoc, LexicalSearchResult};
 // Re-export paged extraction types from ocr crate
 pub use ocr::{ExtractedPage, PagedExtractor};
 
@@ -86,16 +86,23 @@ pub struct Indexer<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: Vector
 	embedder: M,
 	store: Arc<S>,
 	state: Option<Arc<StateManager>>,
+	lexical: Option<Arc<LexicalIndex>>,
 }
 
 impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	pub fn new(options: IndexOptions, extractor: E, embedder: M, store: Arc<S>) -> Self {
-		Self { options, extractor: Arc::new(extractor), embedder, store, state: None }
+		Self { options, extractor: Arc::new(extractor), embedder, store, state: None, lexical: None }
 	}
 	
 	/// Set the state manager for incremental indexing.
 	pub fn with_state(mut self, state: Arc<StateManager>) -> Self {
 		self.state = Some(state);
+		self
+	}
+	
+	/// Set the lexical index for full-text search.
+	pub fn with_lexical(mut self, lexical: Arc<LexicalIndex>) -> Self {
+		self.lexical = Some(lexical);
 		self
 	}
 
@@ -257,6 +264,20 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 									Ok(doc_id) => {
 										embeddings_stored += 1;
 										file_doc_ids.push(doc_id.clone());
+										
+										// Also add to lexical index if configured
+										if let Some(ref lexical) = self.lexical {
+											let lexical_doc = LexicalDoc {
+												doc_id: doc_id.clone(),
+												file_path: path.to_string_lossy().to_string(),
+												content: chunk.clone(),
+												chunk_index: i,
+											};
+											if let Err(e) = lexical.add_document(lexical_doc) {
+												cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
+											}
+										}
+										
 										cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id));
 									}
 									Err(e) => {
@@ -401,6 +422,20 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 								Ok(doc_id) => {
 									embeddings_stored += 1;
 									page_doc_ids.push(doc_id.clone());
+									
+									// Also add to lexical index if configured
+									if let Some(ref lexical) = self.lexical {
+										let lexical_doc = LexicalDoc {
+											doc_id: doc_id.clone(),
+											file_path: path.to_string_lossy().to_string(),
+											content: chunk.clone(),
+											chunk_index: global_chunk_idx,
+										};
+										if let Err(e) = lexical.add_document(lexical_doc) {
+											cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
+										}
+									}
+									
 									cb(IndexEvent::ChunkEmbedded(path.clone(), global_chunk_idx, doc_id));
 								}
 								Err(e) => {
@@ -436,6 +471,11 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 
 		// Persist the store
 		self.store.save().await?;
+		
+		// Commit the lexical index if configured
+		if let Some(ref lexical) = self.lexical {
+			lexical.commit()?;
+		}
 
 		cb(IndexEvent::Done);
 		Ok(IndexResult {

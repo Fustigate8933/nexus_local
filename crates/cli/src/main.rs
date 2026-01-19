@@ -3,7 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore, PagedExtractor, ExtractedPage};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore, PagedExtractor, ExtractedPage, LexicalIndex};
 use ocr::{PlainTextExtractor, SyncOcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
 use store::{LanceVectorStore, StateManager};
@@ -11,6 +11,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
 use sysinfo::System;
+
+/// Result from hybrid search combining vector and lexical results.
+struct HybridResult {
+    doc_id: String,
+    file_path: PathBuf,
+    chunk_index: usize,
+    snippet: Option<String>,
+    score: f32,
+    source: String,
+}
 
 #[derive(Parser)]
 #[command(name = "nexus")]
@@ -51,6 +61,12 @@ enum Commands {
         query: String,
         #[arg(long)]
         json: bool,
+        /// Search mode: semantic (vector), lexical (keyword), or hybrid (both combined)
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+        /// Number of results to return
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: usize,
     },
     /// Explain a document by ID
     Explain {
@@ -144,6 +160,10 @@ async fn main() -> Result<()> {
             // Initialize state manager
             let state = Arc::new(StateManager::new(&data_dir)?);
             eprintln!("info: state manager ready");
+            
+            // Initialize lexical index for full-text search
+            let lexical = Arc::new(LexicalIndex::new(data_dir.clone())?);
+            eprintln!("info: lexical index ready");
 
             let options = IndexOptions { 
                 root: PathBuf::from(&path), 
@@ -156,7 +176,8 @@ async fn main() -> Result<()> {
             let extractor = OcrExtractor(PlainTextExtractor);
             let embedder = EmbedWrapper(embedder);
             let indexer = Indexer::new(options, extractor, embedder, store.clone())
-                .with_state(state);
+                .with_state(state)
+                .with_lexical(lexical);
 
             // Run garbage collection first to clean up stale embeddings
             eprintln!("info: running garbage collection...");
@@ -217,12 +238,15 @@ async fn main() -> Result<()> {
             }
 
             let store = Arc::new(LanceVectorStore::new(data_dir.clone()).await?);
+            let lexical = LexicalIndex::new(data_dir.clone())?;
             let count = store.count().await;
+            let lexical_count = lexical.count().unwrap_or(0);
             println!("nexus status");
             println!("  store: {:?}", data_dir);
-            println!("  embeddings: {}", count);
+            println!("  vector embeddings: {}", count);
+            println!("  lexical documents: {}", lexical_count);
         }
-        Commands::Search { query, json } => {
+        Commands::Search { query, json, mode, limit } => {
             // Initialize data directory
             let data_dir = dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -235,13 +259,98 @@ async fn main() -> Result<()> {
 
             // Load embedder and store
             let embedder = LocalEmbedder::new()?;
-            let store = Arc::new(LanceVectorStore::new(data_dir).await?);
+            let store = Arc::new(LanceVectorStore::new(data_dir.clone()).await?);
+            let lexical = LexicalIndex::new(data_dir)?;
 
-            // Embed the query
-            let query_embedding = embedder.embed(&query).await?;
-
-            // Search
-            let results = store.search(query_embedding, 5).await?;
+            // Collect results based on mode
+            let results = match mode.as_str() {
+                "semantic" | "vector" => {
+                    // Vector-only search
+                    let query_embedding = embedder.embed(&query).await?;
+                    let vector_results = store.search(query_embedding, limit).await?;
+                    vector_results.into_iter().map(|r| HybridResult {
+                        doc_id: r.doc_id,
+                        file_path: r.metadata.file_path,
+                        chunk_index: r.metadata.chunk_index,
+                        snippet: r.snippet,
+                        score: r.score,
+                        source: "semantic".to_string(),
+                    }).collect()
+                }
+                "lexical" | "keyword" => {
+                    // Lexical-only search
+                    let lexical_results = lexical.search(&query, limit)?;
+                    // Need to get snippets from vector store
+                    let mut results = Vec::new();
+                    for r in lexical_results {
+                        let snippet = if let Some(meta) = store.get_metadata(&r.doc_id).await? {
+                            meta.snippet
+                        } else {
+                            None
+                        };
+                        results.push(HybridResult {
+                            doc_id: r.doc_id,
+                            file_path: PathBuf::from(r.file_path),
+                            chunk_index: r.chunk_index,
+                            snippet,
+                            score: r.score,
+                            source: "lexical".to_string(),
+                        });
+                    }
+                    results
+                }
+                "hybrid" | _ => {
+                    // Hybrid search with RRF
+                    let query_embedding = embedder.embed(&query).await?;
+                    let vector_results = store.search(query_embedding, limit * 2).await?;
+                    let lexical_results = lexical.search(&query, limit * 2)?;
+                    
+                    // Apply Reciprocal Rank Fusion (RRF)
+                    let k = 60.0; // RRF constant
+                    let mut doc_scores: std::collections::HashMap<String, (f32, Option<String>, PathBuf, usize)> = 
+                        std::collections::HashMap::new();
+                    
+                    // Add vector results
+                    for (rank, r) in vector_results.iter().enumerate() {
+                        let rrf_score = 1.0 / (k + rank as f32 + 1.0);
+                        let entry = doc_scores.entry(r.doc_id.clone()).or_insert((
+                            0.0,
+                            r.snippet.clone(),
+                            r.metadata.file_path.clone(),
+                            r.metadata.chunk_index,
+                        ));
+                        entry.0 += rrf_score;
+                    }
+                    
+                    // Add lexical results
+                    for (rank, r) in lexical_results.iter().enumerate() {
+                        let rrf_score = 1.0 / (k + rank as f32 + 1.0);
+                        let entry = doc_scores.entry(r.doc_id.clone()).or_insert((
+                            0.0,
+                            None,
+                            PathBuf::from(&r.file_path),
+                            r.chunk_index,
+                        ));
+                        entry.0 += rrf_score;
+                    }
+                    
+                    // Sort by combined RRF score
+                    let mut sorted: Vec<_> = doc_scores.into_iter().collect();
+                    sorted.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    sorted.into_iter()
+                        .take(limit)
+                        .map(|(doc_id, (score, snippet, file_path, chunk_index))| HybridResult {
+                            doc_id,
+                            file_path,
+                            chunk_index,
+                            snippet,
+                            score,
+                            source: "hybrid".to_string(),
+                        })
+                        .collect()
+                }
+            };
 
             if json {
                 // JSON output
@@ -249,29 +358,31 @@ async fn main() -> Result<()> {
                     serde_json::json!({
                         "doc_id": r.doc_id,
                         "score": r.score,
-                        "file_path": r.metadata.file_path,
-                        "chunk_index": r.metadata.chunk_index,
-                        "snippet": r.snippet
+                        "file_path": r.file_path,
+                        "chunk_index": r.chunk_index,
+                        "snippet": r.snippet,
+                        "source": r.source
                     })
                 }).collect();
                 println!("{}", serde_json::to_string_pretty(&json_results)?);
             } else {
                 // Human-readable output
-                println!("search: \"{}\"", query);
+                println!("search: \"{}\" (mode: {})", query, mode);
 
                 if results.is_empty() {
                     println!("  (no results)");
                 } else {
                     for (i, result) in results.iter().enumerate() {
                         println!();
-                        println!("  {}. {} (score: {:.4})", 
+                        println!("  {}. {} (score: {:.4}, {})", 
                             i + 1, 
-                            result.metadata.file_path.display(),
-                            result.score
+                            result.file_path.display(),
+                            result.score,
+                            result.source
                         );
                         println!("     chunk {} | id {}", 
-                            result.metadata.chunk_index, 
-                            &result.doc_id[..8]
+                            result.chunk_index, 
+                            &result.doc_id[..8.min(result.doc_id.len())]
                         );
                         if let Some(snippet) = &result.snippet {
                             let preview: String = snippet.chars().take(80).collect();

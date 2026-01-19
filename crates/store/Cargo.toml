@@ -15,6 +15,7 @@ arrow-schema = "56"
 tokio = { version = "1.37", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+tantivy = "0.24"
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }

@@ -1,10 +1,14 @@
 //! Vector + metadata storage for Nexus Local.
 //!
 //! Uses LanceDB for disk-based vector storage with ANN indexing.
+//! Uses Tantivy for full-text (BM25) lexical search.
 //! Scales to millions of embeddings without loading everything into RAM.
 
 mod state;
+mod lexical;
+
 pub use state::{StateManager, FileState, FileInfo};
+pub use lexical::{LexicalIndex, LexicalDoc, LexicalSearchResult};
 
 use async_trait::async_trait;
 use anyhow::{Result, Context};
