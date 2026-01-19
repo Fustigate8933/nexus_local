@@ -2,6 +2,7 @@
 //!
 //! Provides a trait for extracting text from images and scanned documents using OCR.
 //! Images are automatically resized before OCR to limit memory usage.
+//! PDFs are processed page-by-page to reduce memory footprint.
 
 use std::path::PathBuf;
 use std::fs;
@@ -26,6 +27,27 @@ pub trait OcrEngine: Send + Sync {
 /// Sync trait for parallel text extraction with Rayon.
 pub trait SyncOcrEngine: Send + Sync {
     fn extract_text_sync(&self, path: &PathBuf) -> Result<String>;
+}
+
+/// A single page extracted from a document.
+#[derive(Debug, Clone)]
+pub struct ExtractedPage {
+    /// Page number (0-indexed)
+    pub page_num: usize,
+    /// Total pages in document
+    pub total_pages: usize,
+    /// Extracted text content
+    pub text: String,
+}
+
+/// Trait for page-by-page extraction (for PDFs and multi-page documents).
+pub trait PagedExtractor: Send + Sync {
+    /// Extract pages one at a time. Returns iterator of pages.
+    /// For non-paged documents (txt, images), returns single page with all content.
+    fn extract_pages(&self, path: &PathBuf) -> Result<Vec<ExtractedPage>>;
+    
+    /// Check if this file type supports paged extraction.
+    fn is_paged(&self, path: &PathBuf) -> bool;
 }
 
 /// Preprocesses an image: loads it, resizes if needed, saves to temp file.
@@ -114,6 +136,50 @@ impl OcrEngine for PlainTextExtractor {
 impl SyncOcrEngine for PlainTextExtractor {
     fn extract_text_sync(&self, path: &PathBuf) -> Result<String> {
         self.do_extract(path)
+    }
+}
+
+impl PagedExtractor for PlainTextExtractor {
+    fn extract_pages(&self, path: &PathBuf) -> Result<Vec<ExtractedPage>> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        
+        match ext.as_str() {
+            "pdf" => {
+                // Memory-mapped file reading would be ideal here, but poppler needs the data
+                // For now, we still read the file but process pages individually
+                let mut data = fs::read(path)?;
+                let doc = PopplerDocument::new_from_data(&mut data, None)
+                    .map_err(|e| anyhow::anyhow!("Failed to open PDF: {:?}", e))?;
+                
+                let pages: Vec<_> = doc.pages().collect();
+                let total_pages = pages.len();
+                
+                let mut result = Vec::with_capacity(total_pages);
+                for (page_num, page) in pages.into_iter().enumerate() {
+                    let text = page.get_text().unwrap_or_default().to_string();
+                    result.push(ExtractedPage {
+                        page_num,
+                        total_pages,
+                        text,
+                    });
+                }
+                Ok(result)
+            }
+            _ => {
+                // Non-paged documents: return single page with all content
+                let text = self.do_extract(path)?;
+                Ok(vec![ExtractedPage {
+                    page_num: 0,
+                    total_pages: 1,
+                    text,
+                }])
+            }
+        }
+    }
+    
+    fn is_paged(&self, path: &PathBuf) -> bool {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        ext == "pdf"
     }
 }
 

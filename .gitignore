@@ -28,3 +28,5 @@ __pycache__/
 # Misc
 *.bak
 .idea/
+
+/test_dir

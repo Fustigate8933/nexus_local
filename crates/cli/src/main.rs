@@ -3,7 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore, PagedExtractor, ExtractedPage};
 use ocr::{PlainTextExtractor, SyncOcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
 use store::{LanceVectorStore, StateManager};
@@ -31,6 +31,18 @@ enum Commands {
         /// Skip files larger than this size in MB (default: 50)
         #[arg(long, default_value = "50")]
         max_file_mb: u64,
+        /// Skip specific file extensions (comma-separated, e.g., "png,jpg,jpeg")
+        #[arg(long, value_delimiter = ',')]
+        skip_ext: Vec<String>,
+        /// Skip files whose name contains this substring (can be repeated)
+        #[arg(long)]
+        skip_file: Vec<String>,
+        /// Skip all image files (png, jpg, jpeg) - useful to avoid slow OCR
+        #[arg(long)]
+        skip_images: bool,
+        /// Use GPU (CUDA) for embedding acceleration
+        #[arg(long)]
+        gpu: bool,
     },
     /// Show indexer/search status
     Status,
@@ -52,6 +64,18 @@ struct OcrExtractor(PlainTextExtractor);
 impl SyncTextExtractor for OcrExtractor {
     fn extract_text_sync(&self, path: &PathBuf) -> anyhow::Result<String> {
         self.0.extract_text_sync(path)
+    }
+}
+
+impl PagedExtractor for OcrExtractor {
+    fn extract_pages(&self, path: &PathBuf) -> anyhow::Result<Vec<ExtractedPage>> {
+        // nexus_core::PagedExtractor and ExtractedPage are re-exports from ocr
+        // so they are the same type
+        ocr::PagedExtractor::extract_pages(&self.0, path)
+    }
+    
+    fn is_paged(&self, path: &PathBuf) -> bool {
+        ocr::PagedExtractor::is_paged(&self.0, path)
     }
 }
 
@@ -77,15 +101,31 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { path, max_memory_mb, max_file_mb } => {
+        Commands::Index { path, max_memory_mb, max_file_mb, skip_ext, skip_file, skip_images, gpu } => {
             // Get system memory info
             let sys = System::new_all();
             let total_mem_mb = sys.total_memory() / 1024 / 1024;
             let max_mem = max_memory_mb.unwrap_or(total_mem_mb * 3 / 4);
             
+            // Build skip extensions list
+            let mut skip_extensions: Vec<String> = skip_ext;
+            if skip_images {
+                for ext in ["png", "jpg", "jpeg"] {
+                    if !skip_extensions.iter().any(|s| s.to_lowercase() == ext) {
+                        skip_extensions.push(ext.to_string());
+                    }
+                }
+            }
+            
             eprintln!("info: indexing {}", path);
             eprintln!("info: memory limit {}MB (system: {}MB)\", max file: {}MB", 
                 max_mem, total_mem_mb, max_file_mb);
+            if !skip_extensions.is_empty() {
+                eprintln!("info: skipping extensions: {}", skip_extensions.join(", "));
+            }
+            if !skip_file.is_empty() {
+                eprintln!("info: skipping files matching: {}", skip_file.join(", "));
+            }
 
             // Initialize data directory
             let data_dir = dirs::data_local_dir()
@@ -93,8 +133,8 @@ async fn main() -> Result<()> {
                 .join("nexus_local");
             std::fs::create_dir_all(&data_dir)?;
 
-            eprintln!("info: loading embedding model...");
-            let embedder = LocalEmbedder::new()?;
+            eprintln!("info: loading embedding model{}...", if gpu { " (GPU)" } else { "" });
+            let embedder = LocalEmbedder::new_with_options(gpu)?;
             eprintln!("info: model loaded (dim={})", embedder.dimension());
 
             eprintln!("info: opening store at {:?}", data_dir);
@@ -110,6 +150,8 @@ async fn main() -> Result<()> {
                 chunk_size: 512,
                 max_file_size_bytes: max_file_mb * 1024 * 1024,
                 max_memory_bytes: max_mem * 1024 * 1024,
+                skip_extensions,
+                skip_files: skip_file,
             };
             let extractor = OcrExtractor(PlainTextExtractor);
             let embedder = EmbedWrapper(embedder);
@@ -133,6 +175,9 @@ async fn main() -> Result<()> {
                 match &e {
                     IndexEvent::FileStarted(p) => eprintln!("  processing {}", p.display()),
                     IndexEvent::FileIndexed(p) => eprintln!("  indexed {}", p.display()),
+                    IndexEvent::PageProcessed(p, page, total) => {
+                        eprintln!("    page {}/{} of {}", page + 1, total, p.file_name().unwrap_or_default().to_string_lossy());
+                    }
                     IndexEvent::FileSkipped(_, reason) if reason.contains("memory pressure") => {
                         memory_skipped += 1;
                     }

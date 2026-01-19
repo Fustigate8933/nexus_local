@@ -52,12 +52,15 @@ impl StateManager {
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 file_mtime INTEGER NOT NULL,
-                indexed_at INTEGER NOT NULL
+                indexed_at INTEGER NOT NULL,
+                total_pages INTEGER DEFAULT 1,
+                pages_indexed INTEGER DEFAULT 0
             );
             
             CREATE TABLE IF NOT EXISTS file_docs (
                 path TEXT NOT NULL,
                 doc_id TEXT NOT NULL,
+                page_num INTEGER DEFAULT 0,
                 PRIMARY KEY (path, doc_id),
                 FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
             );
@@ -86,8 +89,8 @@ impl StateManager {
         
         // Upsert file record
         conn.execute(
-            "INSERT INTO files (path, file_mtime, indexed_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET file_mtime = ?2, indexed_at = ?3",
+            "INSERT INTO files (path, file_mtime, indexed_at, total_pages, pages_indexed) VALUES (?1, ?2, ?3, 1, 1)
+             ON CONFLICT(path) DO UPDATE SET file_mtime = ?2, indexed_at = ?3, total_pages = 1, pages_indexed = 1",
             params![path_str, mtime_secs, now],
         )?;
         
@@ -96,12 +99,81 @@ impl StateManager {
         
         for doc_id in doc_ids {
             conn.execute(
-                "INSERT INTO file_docs (path, doc_id) VALUES (?1, ?2)",
+                "INSERT INTO file_docs (path, doc_id, page_num) VALUES (?1, ?2, 0)",
                 params![path_str, doc_id],
             )?;
         }
         
         Ok(())
+    }
+    
+    /// Mark a page as indexed (for paged documents like PDFs).
+    /// This enables resumable indexing - if interrupted, we can continue from last page.
+    pub fn mark_page_indexed(&self, path: &Path, mtime: SystemTime, page_num: usize, total_pages: usize, doc_ids: &[String]) -> Result<()> {
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        
+        let path_str = path.to_string_lossy().to_string();
+        let conn = self.conn.lock().unwrap();
+        
+        // Upsert file record with page progress
+        conn.execute(
+            "INSERT INTO files (path, file_mtime, indexed_at, total_pages, pages_indexed) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET file_mtime = ?2, indexed_at = ?3, total_pages = ?4, pages_indexed = ?5",
+            params![path_str, mtime_secs, now, total_pages as i64, (page_num + 1) as i64],
+        )?;
+        
+        // Insert doc_ids for this page
+        for doc_id in doc_ids {
+            conn.execute(
+                "INSERT OR REPLACE INTO file_docs (path, doc_id, page_num) VALUES (?1, ?2, ?3)",
+                params![path_str, doc_id, page_num as i64],
+            )?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the last indexed page for a file (for resuming).
+    /// Returns None if file not indexed, or the 0-indexed last completed page.
+    pub fn get_resume_page(&self, path: &Path, current_mtime: SystemTime) -> Result<Option<usize>> {
+        let path_str = path.to_string_lossy().to_string();
+        let conn = self.conn.lock().unwrap();
+        
+        let current_mtime_secs = current_mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        
+        let result: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT file_mtime, total_pages, pages_indexed FROM files WHERE path = ?1",
+                params![path_str],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+        
+        match result {
+            Some((stored_mtime, total_pages, pages_indexed)) => {
+                // If file modified, start from scratch
+                if current_mtime_secs > stored_mtime {
+                    return Ok(None);
+                }
+                // If fully indexed, return None (no resume needed)
+                if pages_indexed >= total_pages {
+                    return Ok(None);
+                }
+                // Return last completed page (0-indexed)
+                Ok(Some((pages_indexed - 1).max(0) as usize))
+            }
+            None => Ok(None),
+        }
     }
     
     /// Get the state of a file.

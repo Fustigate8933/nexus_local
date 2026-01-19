@@ -11,6 +11,8 @@ use std::ffi::OsStr;
 use sysinfo::System;
 use rayon::prelude::*;
 pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState};
+// Re-export paged extraction types from ocr crate
+pub use ocr::{ExtractedPage, PagedExtractor};
 
 /// Options for configuring the indexer.
 pub struct IndexOptions {
@@ -20,6 +22,10 @@ pub struct IndexOptions {
 	pub max_file_size_bytes: u64,
 	/// Maximum memory to use (bytes). Used for throttling.
 	pub max_memory_bytes: u64,
+	/// File extensions to skip (e.g., ["png", "jpg"] to skip images).
+	pub skip_extensions: Vec<String>,
+	/// File name patterns to skip (substring match).
+	pub skip_files: Vec<String>,
 }
 
 impl Default for IndexOptions {
@@ -29,6 +35,8 @@ impl Default for IndexOptions {
 			chunk_size: 512,
 			max_file_size_bytes: 50 * 1024 * 1024, // 50MB
 			max_memory_bytes: 4 * 1024 * 1024 * 1024, // 4GB
+			skip_extensions: Vec::new(),
+			skip_files: Vec::new(),
 		}
 	}
 }
@@ -42,6 +50,7 @@ pub enum IndexEvent {
 	FileSkipped(PathBuf, String),
 	FileUnchanged(PathBuf), // File already indexed and not modified
 	MemoryPressure(u64, u64), // (used_mb, limit_mb) - pausing due to memory pressure
+	PageProcessed(PathBuf, usize, usize), // (path, page_num, total_pages)
 	ChunkProcessed(PathBuf, usize),
 	ChunkEmbedded(PathBuf, usize, String), // path, chunk_index, doc_id
 	Done,
@@ -70,7 +79,8 @@ pub struct GcResult {
 
 /// Main orchestrator for the indexing pipeline.
 /// Uses parallel text extraction with Rayon, followed by batched embedding.
-pub struct Indexer<E: SyncTextExtractor, M: Embedder, S: VectorStore> {
+/// Supports page-by-page PDF processing for reduced memory usage and resumability.
+pub struct Indexer<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> {
 	options: IndexOptions,
 	extractor: Arc<E>,
 	embedder: M,
@@ -78,7 +88,7 @@ pub struct Indexer<E: SyncTextExtractor, M: Embedder, S: VectorStore> {
 	state: Option<Arc<StateManager>>,
 }
 
-impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
+impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	pub fn new(options: IndexOptions, extractor: E, embedder: M, store: Arc<S>) -> Self {
 		Self { options, extractor: Arc::new(extractor), embedder, store, state: None }
 	}
@@ -129,12 +139,13 @@ impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	}
 
 	/// Run the indexing pipeline, reporting progress via callback.
-	/// Uses parallel text extraction with Rayon for improved performance.
+	/// Uses parallel text extraction with Rayon for non-paged files.
+	/// For paged files (PDFs), processes page-by-page with checkpoints.
 	pub async fn run_with_progress<F>(&mut self, mut cb: F) -> Result<IndexResult>
 	where
 		F: FnMut(IndexEvent) + Send,
 	{
-		let files = discover_files(&self.options.root)?;
+		let files = discover_files(&self.options.root, &self.options.skip_extensions, &self.options.skip_files)?;
 		let chunk_size = self.options.chunk_size;
 		let max_file_size = self.options.max_file_size_bytes;
 		let max_memory = self.options.max_memory_bytes;
@@ -154,12 +165,16 @@ impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 			// Continue anyway but warn - parallel extraction will proceed
 		}
 
-		// Phase 1: Parallel text extraction with Rayon
-		// Each item: (path, chunks, file_type) or error
+		// Separate paged files (PDFs) from non-paged files
+		let (paged_files, non_paged_files): (Vec<_>, Vec<_>) = files
+			.into_iter()
+			.partition(|path| self.extractor.is_paged(path));
+
+		// Phase 1: Parallel text extraction with Rayon for non-paged files
 		let extractor = self.extractor.clone();
 		let state = self.state.clone();
 		
-		let extraction_results: Vec<_> = files
+		let extraction_results: Vec<_> = non_paged_files
 			.par_iter()
 			.filter_map(|path| {
 				// Check file size
@@ -197,7 +212,7 @@ impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 			})
 			.collect();
 
-		// Phase 2: Sequential embedding and storage
+		// Phase 2: Sequential embedding and storage for non-paged files
 		let mut files_indexed = 0;
 		let mut chunks_indexed = 0;
 		let mut embeddings_stored = 0;
@@ -282,6 +297,143 @@ impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 			}
 		}
 
+		// Phase 3: Page-by-page processing for paged files (PDFs)
+		for path in paged_files {
+			// Check file size
+			if let Ok(metadata) = std::fs::metadata(&path) {
+				if metadata.len() > max_file_size {
+					files_skipped.fetch_add(1, Ordering::Relaxed);
+					continue;
+				}
+			}
+			
+			// Get mtime for state tracking
+			let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+				Ok(t) => t,
+				Err(_) => {
+					errors.push((path.clone(), "Failed to get file mtime".to_string()));
+					continue;
+				}
+			};
+			
+			// Check if file needs indexing (for full file)
+			if let Some(ref state) = self.state {
+				match state.needs_indexing(&path) {
+					Ok(false) => {
+						files_unchanged.fetch_add(1, Ordering::Relaxed);
+						continue;
+					}
+					Ok(true) => {}
+					Err(_) => {} // Index anyway on error
+				}
+			}
+
+			cb(IndexEvent::FileStarted(path.clone()));
+			
+			// Get resume page if interrupted previously
+			let resume_page = self.state.as_ref()
+				.and_then(|s| s.get_resume_page(&path, mtime).ok())
+				.flatten()
+				.unwrap_or(0);
+
+			// Extract all pages
+			let pages = match self.extractor.extract_pages(&path) {
+				Ok(p) => p,
+				Err(e) => {
+					let err_str = format!("Failed to extract pages: {}", e);
+					cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+					errors.push((path.clone(), err_str));
+					continue;
+				}
+			};
+
+			if pages.is_empty() {
+				cb(IndexEvent::FileIndexed(path));
+				continue;
+			}
+
+			let total_pages = pages.len();
+			let file_type = path.extension()
+				.and_then(|e| e.to_str())
+				.unwrap_or("pdf")
+				.to_string();
+
+			// Process each page
+			for page in pages.into_iter().skip(resume_page) {
+				// Skip already indexed pages
+				let page_num = page.page_num;
+				
+				if page.text.trim().is_empty() {
+					cb(IndexEvent::PageProcessed(path.clone(), page_num, total_pages));
+					continue;
+				}
+
+				// Chunk the page text
+				let chunks = chunk_text(&page.text, chunk_size);
+				let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+				
+				let mut page_doc_ids: Vec<String> = Vec::new();
+				
+				match self.embedder.embed_batch(&chunk_refs).await {
+					Ok(embeddings) => {
+						for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.into_iter()).enumerate() {
+							chunks_indexed += 1;
+							// Chunk index includes page offset for uniqueness
+							let global_chunk_idx = page_num * 1000 + i;
+							cb(IndexEvent::ChunkProcessed(path.clone(), global_chunk_idx));
+
+							let snippet = if chunk.chars().count() > 200 {
+								let truncated: String = chunk.chars().take(200).collect();
+								Some(format!("{}...", truncated))
+							} else {
+								Some(chunk.clone())
+							};
+
+							let metadata = DocumentMetadata {
+								doc_id: String::new(),
+								file_path: path.clone(),
+								file_type: file_type.clone(),
+								chunk_index: global_chunk_idx,
+								snippet,
+							};
+
+							match self.store.add_embedding(embedding, metadata).await {
+								Ok(doc_id) => {
+									embeddings_stored += 1;
+									page_doc_ids.push(doc_id.clone());
+									cb(IndexEvent::ChunkEmbedded(path.clone(), global_chunk_idx, doc_id));
+								}
+								Err(e) => {
+									let err_str = format!("Failed to store embedding: {}", e);
+									cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+									errors.push((path.clone(), err_str));
+								}
+							}
+						}
+					}
+					Err(e) => {
+						let err_str = format!("Embedding page {} failed: {}", page_num, e);
+						cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+						errors.push((path.clone(), err_str));
+						continue;
+					}
+				}
+
+				// Checkpoint: mark this page as indexed
+				if let Some(ref state) = self.state {
+					if let Err(e) = state.mark_page_indexed(&path, mtime, page_num, total_pages, &page_doc_ids) {
+						eprintln!("  warning: failed to checkpoint page {} of {}: {}", 
+							page_num, path.display(), e);
+					}
+				}
+
+				cb(IndexEvent::PageProcessed(path.clone(), page_num, total_pages));
+			}
+
+			files_indexed += 1;
+			cb(IndexEvent::FileIndexed(path));
+		}
+
 		// Persist the store
 		self.store.save().await?;
 
@@ -298,14 +450,25 @@ impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 }
 
 /// Recursively discover supported files in a directory.
-fn discover_files(root: &PathBuf) -> Result<Vec<PathBuf>> {
+fn discover_files(root: &PathBuf, skip_extensions: &[String], skip_files: &[String]) -> Result<Vec<PathBuf>> {
 	let mut files = Vec::new();
 	let supported = ["txt", "md", "pdf", "png", "jpg", "jpeg"];
 	for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
 		let path = entry.path();
 		if path.is_file() {
+			// Skip if filename matches any skip pattern
+			if let Some(filename) = path.file_name().and_then(OsStr::to_str) {
+				if skip_files.iter().any(|pattern| filename.contains(pattern)) {
+					continue;
+				}
+			}
 			if let Some(ext) = path.extension().and_then(OsStr::to_str) {
-				if supported.contains(&ext.to_lowercase().as_str()) {
+				let ext_lower = ext.to_lowercase();
+				// Skip if extension in skip list
+				if skip_extensions.iter().any(|s| s.to_lowercase() == ext_lower) {
+					continue;
+				}
+				if supported.contains(&ext_lower.as_str()) {
 					files.push(path.to_path_buf());
 				}
 			}
