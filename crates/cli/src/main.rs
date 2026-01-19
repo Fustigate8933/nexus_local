@@ -53,6 +53,9 @@ enum Commands {
         /// Use GPU (CUDA) for embedding acceleration
         #[arg(long)]
         gpu: bool,
+        /// Maximum chunks per file (default: 500). Files generating more are skipped.
+        #[arg(long, default_value = "500")]
+        max_chunks: usize,
     },
     /// Show indexer/search status
     Status,
@@ -117,7 +120,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { path, max_memory_mb, max_file_mb, skip_ext, skip_file, skip_images, gpu } => {
+        Commands::Index { path, max_memory_mb, max_file_mb, skip_ext, skip_file, skip_images, gpu, max_chunks } => {
             // Get system memory info
             let sys = System::new_all();
             let total_mem_mb = sys.total_memory() / 1024 / 1024;
@@ -134,8 +137,8 @@ async fn main() -> Result<()> {
             }
             
             eprintln!("info: indexing {}", path);
-            eprintln!("info: memory limit {}MB (system: {}MB)\", max file: {}MB", 
-                max_mem, total_mem_mb, max_file_mb);
+            eprintln!("info: memory limit {}MB (system: {}MB), max file: {}MB, max chunks: {}", 
+                max_mem, total_mem_mb, max_file_mb, max_chunks);
             if !skip_extensions.is_empty() {
                 eprintln!("info: skipping extensions: {}", skip_extensions.join(", "));
             }
@@ -167,9 +170,10 @@ async fn main() -> Result<()> {
 
             let options = IndexOptions { 
                 root: PathBuf::from(&path), 
-                chunk_size: 512,
+                chunk_size: 1500,
                 max_file_size_bytes: max_file_mb * 1024 * 1024,
                 max_memory_bytes: max_mem * 1024 * 1024,
+                max_chunks_per_file: max_chunks,
                 skip_extensions,
                 skip_files: skip_file,
             };

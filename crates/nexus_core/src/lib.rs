@@ -22,6 +22,9 @@ pub struct IndexOptions {
 	pub max_file_size_bytes: u64,
 	/// Maximum memory to use (bytes). Used for throttling.
 	pub max_memory_bytes: u64,
+	/// Maximum chunks per file. Files generating more chunks are skipped.
+	/// Prevents dictionary/wordlist files from creating thousands of embeddings.
+	pub max_chunks_per_file: usize,
 	/// File extensions to skip (e.g., ["png", "jpg"] to skip images).
 	pub skip_extensions: Vec<String>,
 	/// File name patterns to skip (substring match).
@@ -32,9 +35,10 @@ impl Default for IndexOptions {
 	fn default() -> Self {
 		Self { 
 			root: PathBuf::new(), 
-			chunk_size: 512,
+			chunk_size: 1500, // ~375 tokens, good balance of context vs granularity
 			max_file_size_bytes: 50 * 1024 * 1024, // 50MB
 			max_memory_bytes: 4 * 1024 * 1024 * 1024, // 4GB
+			max_chunks_per_file: 500, // Skip files that would create >500 chunks
 			skip_extensions: Vec::new(),
 			skip_files: Vec::new(),
 		}
@@ -156,6 +160,7 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 		let chunk_size = self.options.chunk_size;
 		let max_file_size = self.options.max_file_size_bytes;
 		let max_memory = self.options.max_memory_bytes;
+		let max_chunks = self.options.max_chunks_per_file;
 
 		// Counters for skipped/unchanged (used in parallel phase)
 		let files_skipped = AtomicUsize::new(0);
@@ -208,6 +213,13 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 				match extractor.extract_text_sync(path) {
 					Ok(contents) => {
 						let chunks = chunk_text(&contents, chunk_size);
+						
+						// Skip files with too many chunks (e.g., dictionaries, wordlists)
+						if chunks.len() > max_chunks {
+							files_skipped.fetch_add(1, Ordering::Relaxed);
+							return None;
+						}
+						
 						let file_type = path.extension()
 							.and_then(|e| e.to_str())
 							.unwrap_or("unknown")
@@ -219,7 +231,7 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 			})
 			.collect();
 
-		// Phase 2: Sequential embedding and storage for non-paged files
+		// Phase 2: Sequential embedding and batch storage for non-paged files
 		let mut files_indexed = 0;
 		let mut chunks_indexed = 0;
 		let mut embeddings_stored = 0;
@@ -235,56 +247,75 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 						continue;
 					}
 
-					let mut file_doc_ids: Vec<String> = Vec::new();
 					let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
 					
 					match self.embedder.embed_batch(&chunk_refs).await {
 						Ok(embeddings) => {
-							for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.into_iter()).enumerate() {
-								chunks_indexed += 1;
-								cb(IndexEvent::ChunkProcessed(path.clone(), i));
+							chunks_indexed += chunks.len();
+							
+							// Prepare all metadata for batch insert
+							let metadata_batch: Vec<DocumentMetadata> = chunks.iter()
+								.enumerate()
+								.map(|(i, chunk)| {
+									let snippet = if chunk.chars().count() > 200 {
+										let truncated: String = chunk.chars().take(200).collect();
+										Some(format!("{}...", truncated))
+									} else {
+										Some(chunk.clone())
+									};
+									DocumentMetadata {
+										doc_id: String::new(),
+										file_path: path.clone(),
+										file_type: file_type.clone(),
+										chunk_index: i,
+										snippet,
+									}
+								})
+								.collect();
 
-								// Safe truncation for UTF-8 strings
-								let snippet = if chunk.chars().count() > 200 {
-									let truncated: String = chunk.chars().take(200).collect();
-									Some(format!("{}...", truncated))
-								} else {
-									Some(chunk.clone())
-								};
-
-								let metadata = DocumentMetadata {
-									doc_id: String::new(),
-									file_path: path.clone(),
-									file_type: file_type.clone(),
-									chunk_index: i,
-									snippet,
-								};
-
-								match self.store.add_embedding(embedding, metadata).await {
-									Ok(doc_id) => {
-										embeddings_stored += 1;
-										file_doc_ids.push(doc_id.clone());
-										
-										// Also add to lexical index if configured
-										if let Some(ref lexical) = self.lexical {
-											let lexical_doc = LexicalDoc {
+							// Batch insert all embeddings for this file at once
+							match self.store.add_embeddings_batch(embeddings, metadata_batch).await {
+								Ok(doc_ids) => {
+									embeddings_stored += doc_ids.len();
+									
+									// Batch add to lexical index if configured
+									if let Some(ref lexical) = self.lexical {
+										let lexical_docs: Vec<LexicalDoc> = doc_ids.iter()
+											.zip(chunks.iter())
+											.enumerate()
+											.map(|(i, (doc_id, chunk))| LexicalDoc {
 												doc_id: doc_id.clone(),
 												file_path: path.to_string_lossy().to_string(),
 												content: chunk.clone(),
 												chunk_index: i,
-											};
-											if let Err(e) = lexical.add_document(lexical_doc) {
-												cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
+											})
+											.collect();
+										if let Err(e) = lexical.add_documents(lexical_docs) {
+											cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
+										}
+									}
+									
+									// Report progress for each chunk
+									for (i, doc_id) in doc_ids.iter().enumerate() {
+										cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id.clone()));
+									}
+									
+									// Mark file as indexed in state manager
+									if let Some(ref state) = self.state {
+										if let Ok(meta) = std::fs::metadata(&path) {
+											if let Ok(mtime) = meta.modified() {
+												if let Err(e) = state.mark_indexed(&path, mtime, &doc_ids) {
+													eprintln!("  warning: failed to update state for {}: {}", path.display(), e);
+												}
 											}
 										}
-										
-										cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id));
 									}
-									Err(e) => {
-										let err_str = format!("Failed to store embedding: {}", e);
-										cb(IndexEvent::FileError(path.clone(), err_str.clone()));
-										errors.push((path.clone(), err_str));
-									}
+									files_indexed += 1;
+								}
+								Err(e) => {
+									let err_str = format!("Failed to store embeddings: {}", e);
+									cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+									errors.push((path.clone(), err_str));
 								}
 							}
 						}
@@ -293,20 +324,6 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 							cb(IndexEvent::FileError(path.clone(), err_str.clone()));
 							errors.push((path.clone(), err_str));
 						}
-					}
-					
-					// Mark file as indexed in state manager
-					if !file_doc_ids.is_empty() {
-						if let Some(ref state) = self.state {
-							if let Ok(meta) = std::fs::metadata(&path) {
-								if let Ok(mtime) = meta.modified() {
-									if let Err(e) = state.mark_indexed(&path, mtime, &file_doc_ids) {
-										eprintln!("  warning: failed to update state for {}: {}", path.display(), e);
-									}
-								}
-							}
-						}
-						files_indexed += 1;
 					}
 					
 					cb(IndexEvent::FileIndexed(path));
@@ -393,56 +410,74 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 				let chunks = chunk_text(&page.text, chunk_size);
 				let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
 				
-				let mut page_doc_ids: Vec<String> = Vec::new();
-				
 				match self.embedder.embed_batch(&chunk_refs).await {
 					Ok(embeddings) => {
-						for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.into_iter()).enumerate() {
-							chunks_indexed += 1;
-							// Chunk index includes page offset for uniqueness
-							let global_chunk_idx = page_num * 1000 + i;
-							cb(IndexEvent::ChunkProcessed(path.clone(), global_chunk_idx));
+						chunks_indexed += chunks.len();
+						
+						// Prepare metadata for batch insert
+						let metadata_batch: Vec<DocumentMetadata> = chunks.iter()
+							.enumerate()
+							.map(|(i, chunk)| {
+								let global_chunk_idx = page_num * 1000 + i;
+								let snippet = if chunk.chars().count() > 200 {
+									let truncated: String = chunk.chars().take(200).collect();
+									Some(format!("{}...", truncated))
+								} else {
+									Some(chunk.clone())
+								};
+								DocumentMetadata {
+									doc_id: String::new(),
+									file_path: path.clone(),
+									file_type: file_type.clone(),
+									chunk_index: global_chunk_idx,
+									snippet,
+								}
+							})
+							.collect();
 
-							let snippet = if chunk.chars().count() > 200 {
-								let truncated: String = chunk.chars().take(200).collect();
-								Some(format!("{}...", truncated))
-							} else {
-								Some(chunk.clone())
-							};
-
-							let metadata = DocumentMetadata {
-								doc_id: String::new(),
-								file_path: path.clone(),
-								file_type: file_type.clone(),
-								chunk_index: global_chunk_idx,
-								snippet,
-							};
-
-							match self.store.add_embedding(embedding, metadata).await {
-								Ok(doc_id) => {
-									embeddings_stored += 1;
-									page_doc_ids.push(doc_id.clone());
-									
-									// Also add to lexical index if configured
-									if let Some(ref lexical) = self.lexical {
-										let lexical_doc = LexicalDoc {
-											doc_id: doc_id.clone(),
-											file_path: path.to_string_lossy().to_string(),
-											content: chunk.clone(),
-											chunk_index: global_chunk_idx,
-										};
-										if let Err(e) = lexical.add_document(lexical_doc) {
-											cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
-										}
+						// Batch insert all page embeddings at once
+						match self.store.add_embeddings_batch(embeddings, metadata_batch).await {
+							Ok(doc_ids) => {
+								embeddings_stored += doc_ids.len();
+								
+								// Batch add to lexical index if configured
+								if let Some(ref lexical) = self.lexical {
+									let lexical_docs: Vec<LexicalDoc> = doc_ids.iter()
+										.zip(chunks.iter())
+										.enumerate()
+										.map(|(i, (doc_id, chunk))| {
+											let global_chunk_idx = page_num * 1000 + i;
+											LexicalDoc {
+												doc_id: doc_id.clone(),
+												file_path: path.to_string_lossy().to_string(),
+												content: chunk.clone(),
+												chunk_index: global_chunk_idx,
+											}
+										})
+										.collect();
+									if let Err(e) = lexical.add_documents(lexical_docs) {
+										cb(IndexEvent::FileError(path.clone(), format!("Lexical index error: {}", e)));
 									}
-									
-									cb(IndexEvent::ChunkEmbedded(path.clone(), global_chunk_idx, doc_id));
 								}
-								Err(e) => {
-									let err_str = format!("Failed to store embedding: {}", e);
-									cb(IndexEvent::FileError(path.clone(), err_str.clone()));
-									errors.push((path.clone(), err_str));
+								
+								// Report progress
+								for (i, doc_id) in doc_ids.iter().enumerate() {
+									let global_chunk_idx = page_num * 1000 + i;
+									cb(IndexEvent::ChunkEmbedded(path.clone(), global_chunk_idx, doc_id.clone()));
 								}
+
+								// Checkpoint: mark this page as indexed
+								if let Some(ref state) = self.state {
+									if let Err(e) = state.mark_page_indexed(&path, mtime, page_num, total_pages, &doc_ids) {
+										eprintln!("  warning: failed to checkpoint page {} of {}: {}", 
+											page_num, path.display(), e);
+									}
+								}
+							}
+							Err(e) => {
+								let err_str = format!("Failed to store page {} embeddings: {}", page_num, e);
+								cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+								errors.push((path.clone(), err_str));
 							}
 						}
 					}
@@ -451,14 +486,6 @@ impl<E: SyncTextExtractor + PagedExtractor, M: Embedder, S: VectorStore> Indexer
 						cb(IndexEvent::FileError(path.clone(), err_str.clone()));
 						errors.push((path.clone(), err_str));
 						continue;
-					}
-				}
-
-				// Checkpoint: mark this page as indexed
-				if let Some(ref state) = self.state {
-					if let Err(e) = state.mark_page_indexed(&path, mtime, page_num, total_pages, &page_doc_ids) {
-						eprintln!("  warning: failed to checkpoint page {} of {}: {}", 
-							page_num, path.display(), e);
 					}
 				}
 
@@ -518,22 +545,99 @@ fn discover_files(root: &PathBuf, skip_extensions: &[String], skip_files: &[Stri
 }
 
 /// Split text into chunks of roughly `max_len` characters.
+/// Uses a smarter strategy:
+/// 1. First try to split by paragraphs (double newlines)
+/// 2. For content with many short lines, group them more aggressively
+/// 3. Never break mid-word if possible
 fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
+	// First, try paragraph-based chunking (split on double newlines)
+	let paragraphs: Vec<&str> = text.split("\n\n").collect();
+	
+	// If we have reasonable paragraphs, use them
+	if paragraphs.len() > 1 && paragraphs.len() < text.len() / 100 {
+		return chunk_by_paragraphs(&paragraphs, max_len);
+	}
+	
+	// Otherwise, use character-based chunking (better for short-line content)
+	chunk_by_chars(text, max_len)
+}
+
+/// Chunk by paragraphs, merging small ones and splitting large ones.
+fn chunk_by_paragraphs(paragraphs: &[&str], max_len: usize) -> Vec<String> {
 	let mut chunks = Vec::new();
 	let mut current = String::new();
-	for line in text.lines() {
-		if current.len() + line.len() > max_len && !current.is_empty() {
+	
+	for para in paragraphs {
+		let para = para.trim();
+		if para.is_empty() {
+			continue;
+		}
+		
+		// If adding this paragraph would exceed limit
+		if !current.is_empty() && current.len() + para.len() + 2 > max_len {
 			chunks.push(current.clone());
 			current.clear();
 		}
-		if !current.is_empty() {
-			current.push('\n');
+		
+		// If single paragraph is too long, split it
+		if para.len() > max_len {
+			if !current.is_empty() {
+				chunks.push(current.clone());
+				current.clear();
+			}
+			chunks.extend(chunk_by_chars(para, max_len));
+			continue;
 		}
-		current.push_str(line);
+		
+		if !current.is_empty() {
+			current.push_str("\n\n");
+		}
+		current.push_str(para);
 	}
+	
 	if !current.is_empty() {
 		chunks.push(current);
 	}
+	chunks
+}
+
+/// Character-based chunking that respects word boundaries.
+/// Much better for short-line content (poetry, lyrics, code).
+fn chunk_by_chars(text: &str, max_len: usize) -> Vec<String> {
+	let mut chunks = Vec::new();
+	let mut start = 0;
+	let chars: Vec<char> = text.chars().collect();
+	let len = chars.len();
+	
+	while start < len {
+		let mut end = (start + max_len).min(len);
+		
+		// If we're not at the end, try to break at a word boundary
+		if end < len {
+			// Look back for a space or newline
+			let mut break_pos = end;
+			while break_pos > start && !chars[break_pos].is_whitespace() {
+				break_pos -= 1;
+			}
+			// If we found a good break point (not all the way back to start)
+			if break_pos > start + max_len / 2 {
+				end = break_pos;
+			}
+		}
+		
+		let chunk: String = chars[start..end].iter().collect();
+		let trimmed = chunk.trim();
+		if !trimmed.is_empty() {
+			chunks.push(trimmed.to_string());
+		}
+		start = end;
+		
+		// Skip leading whitespace for next chunk
+		while start < len && chars[start].is_whitespace() {
+			start += 1;
+		}
+	}
+	
 	chunks
 }
 

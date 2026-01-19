@@ -51,6 +51,8 @@ pub struct SearchResult {
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     async fn add_embedding(&self, embedding: Vec<f32>, metadata: DocumentMetadata) -> Result<String>;
+    /// Add multiple embeddings in a single batch operation (much faster than individual inserts).
+    async fn add_embeddings_batch(&self, embeddings: Vec<Vec<f32>>, metadata: Vec<DocumentMetadata>) -> Result<Vec<String>>;
     async fn search(&self, query: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>>;
     async fn get_metadata(&self, doc_id: &str) -> Result<Option<DocumentMetadata>>;
     async fn delete_by_doc_ids(&self, doc_ids: &[String]) -> Result<usize>;
@@ -143,6 +145,50 @@ impl LanceVectorStore {
         
         Ok(batch)
     }
+
+    /// Create a RecordBatch from multiple embeddings + metadata (batch insert).
+    fn create_batch_multi(embeddings: &[Vec<f32>], metadata: &[DocumentMetadata]) -> Result<RecordBatch> {
+        let schema = Self::schema();
+        let n = embeddings.len();
+        
+        let doc_ids: Vec<&str> = metadata.iter().map(|m| m.doc_id.as_str()).collect();
+        let file_paths: Vec<String> = metadata.iter().map(|m| m.file_path.to_string_lossy().to_string()).collect();
+        let file_types: Vec<&str> = metadata.iter().map(|m| m.file_type.as_str()).collect();
+        let chunk_indices: Vec<i32> = metadata.iter().map(|m| m.chunk_index as i32).collect();
+        let snippets: Vec<Option<&str>> = metadata.iter().map(|m| m.snippet.as_deref()).collect();
+        
+        let doc_id_array = StringArray::from(doc_ids);
+        let file_path_array = StringArray::from(file_paths.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let file_type_array = StringArray::from(file_types);
+        let chunk_index_array = Int32Array::from(chunk_indices);
+        let snippet_array = StringArray::from(snippets);
+        
+        // Create FixedSizeList for all embedding vectors
+        let mut list_builder = FixedSizeListBuilder::new(Float32Builder::new(), EMBEDDING_DIM);
+        for embedding in embeddings {
+            let values_builder = list_builder.values();
+            for v in embedding {
+                values_builder.append_value(*v);
+            }
+            list_builder.append(true);
+        }
+        let vector_array = list_builder.finish();
+        
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(doc_id_array) as ArrayRef,
+                Arc::new(file_path_array) as ArrayRef,
+                Arc::new(file_type_array) as ArrayRef,
+                Arc::new(chunk_index_array) as ArrayRef,
+                Arc::new(snippet_array) as ArrayRef,
+                Arc::new(vector_array) as ArrayRef,
+            ],
+        )?;
+        
+        debug_assert_eq!(batch.num_rows(), n);
+        Ok(batch)
+    }
 }
 
 #[async_trait]
@@ -174,6 +220,45 @@ impl VectorStore for LanceVectorStore {
         }
         
         Ok(doc_id)
+    }
+
+    async fn add_embeddings_batch(&self, embeddings: Vec<Vec<f32>>, metadata: Vec<DocumentMetadata>) -> Result<Vec<String>> {
+        if embeddings.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // Generate doc_ids for any missing ones
+        let metadata_with_ids: Vec<DocumentMetadata> = metadata
+            .into_iter()
+            .map(|m| {
+                if m.doc_id.is_empty() {
+                    DocumentMetadata { doc_id: Uuid::new_v4().to_string(), ..m }
+                } else {
+                    m
+                }
+            })
+            .collect();
+        
+        let doc_ids: Vec<String> = metadata_with_ids.iter().map(|m| m.doc_id.clone()).collect();
+        
+        // Create single batch with all embeddings
+        let batch = Self::create_batch_multi(&embeddings, &metadata_with_ids)?;
+        
+        let mut table_guard = self.table.write().await;
+        
+        if let Some(ref table) = *table_guard {
+            table.add(
+                RecordBatchIterator::new(vec![Ok(batch)], Self::schema())
+            ).execute().await?;
+        } else {
+            let new_table = self.db.create_table(
+                TABLE_NAME,
+                RecordBatchIterator::new(vec![Ok(batch)], Self::schema()),
+            ).execute().await?;
+            *table_guard = Some(new_table);
+        }
+        
+        Ok(doc_ids)
     }
 
     async fn search(&self, query: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>> {
@@ -347,6 +432,10 @@ pub struct DummyStore;
 impl VectorStore for DummyStore {
     async fn add_embedding(&self, _embedding: Vec<f32>, metadata: DocumentMetadata) -> Result<String> {
         Ok(metadata.doc_id)
+    }
+
+    async fn add_embeddings_batch(&self, _embeddings: Vec<Vec<f32>>, metadata: Vec<DocumentMetadata>) -> Result<Vec<String>> {
+        Ok(metadata.into_iter().map(|m| m.doc_id).collect())
     }
 
     async fn search(&self, _query: Vec<f32>, _top_k: usize) -> Result<Vec<SearchResult>> {
