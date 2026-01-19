@@ -133,15 +133,7 @@ All data is stored in `~/.local/share/nexus_local/`:
 
 $$\text{RRF}(d) = \sum_{r \in R} \frac{1}{k + \text{rank}_r(d)}$$
 
-Where $k = 60$ (constant) and $R$ = {semantic, lexical} result sets.
-
-### Why Hybrid?
-
-| Query Type | Semantic | Lexical | Hybrid |
-|------------|----------|---------|--------|
-| "ML optimization" → "machine learning" | ✅ | ❌ | ✅ |
-| Exact term: "BERT-base-uncased" | ❌ | ✅ | ✅ |
-| Typos: "reccomendation system" | ✅ | ❌ | ✅ |
+Where $k = 60$ (constant) and $R$ = {semantic, lexical}
 
 ## Configuration
 
@@ -164,24 +156,6 @@ Where $k = 60$ (constant) and $R$ = {semantic, lexical} result sets.
 | `.txt`, `.md` | Direct text read |
 | `.pdf` | pdf-extract (text layer) or OCR fallback |
 | `.png`, `.jpg`, `.jpeg` | Tesseract OCR |
-
-## Performance
-
-### Embedding Speed (all-MiniLM-L6-v2, 384 dims)
-
-| Mode | Speed | Hardware |
-|------|-------|----------|
-| CPU | ~50 chunks/sec | Ryzen 7 5800X |
-| GPU | ~300 chunks/sec | RTX 3080 |
-
-### Storage Overhead
-
-| Component | Per 1K chunks |
-|-----------|---------------|
-| LanceDB vectors | ~1.5 MB |
-| LanceDB metadata | ~200 KB |
-| Tantivy index | ~100 KB |
-| SQLite state | ~50 KB |
 
 ## Development
 
