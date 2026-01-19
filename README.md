@@ -2,7 +2,7 @@
 
 **Local-first, privacy-preserving semantic search for your documents.**
 
-Nexus Local indexes your files (PDFs, text, images) and lets you search them using natural language queries. All processing happens locally—your data never leaves your machine.
+Nexus Local indexes your files (PDFs, text, images) and lets you search them using natural language queries. All processing happens locally; your data never leaves your machine.
 
 ## Features
 
