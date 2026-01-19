@@ -148,14 +148,22 @@ Where $k = 60$ (constant) and $R$ = {semantic, lexical}
 | `--max-file-mb <MB>` | Skip files larger than this | 50 |
 | `--mode <mode>` | Search mode: semantic, lexical, hybrid | hybrid |
 | `-n <count>` | Number of search results | 5 |
+| `--max-chunks <N>` | Skip files with >N chunks (edge cases) | 500 |
 
 ### Supported File Types
 
-| Extension | Method |
-|-----------|--------|
-| `.txt`, `.md` | Direct text read |
-| `.pdf` | pdf-extract (text layer) or OCR fallback |
-| `.png`, `.jpg`, `.jpeg` | Tesseract OCR |
+| Category | Extensions |
+|----------|------------|
+| **Documents** | txt, md, markdown, rst, org, tex, rtf |
+| **Office** | docx, xlsx, pptx (Microsoft), odt, odp (OpenDocument) |
+| **Code** | py, rs, js, ts, jsx, tsx, cpp, c, h, hpp, go, java, kt, scala, rb, php, swift, cs, fs, r, lua, pl, hs, ml, ex, erl, clj, lisp, zig, nim, d, v, vhd, asm... |
+| **Shell** | sh, bash, zsh, fish, ps1, bat, cmd |
+| **Config** | json, yaml, yml, toml, xml, ini, cfg, conf, env, properties, plist |
+| **Web** | html, htm, css, scss, sass, less, svg |
+| **Data** | sql, graphql, csv, tsv, log, diff, patch |
+| **PDF** | pdf (text layer via poppler) |
+| **Images** | png, jpg, jpeg, webp, bmp, tiff (OCR via Tesseract) |
+| **No extension** | Makefile, Dockerfile, LICENSE, README, .gitignore, etc. |
 
 ## Development
 
