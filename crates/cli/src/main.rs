@@ -3,10 +3,14 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor, VectorStore};
 use ocr::{PlainTextExtractor, OcrEngine};
+use embed::{LocalEmbedder, Embedder as EmbedderTrait};
+use store::LocalVectorStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 use async_trait::async_trait;
+use sysinfo::System;
 
 #[derive(Parser)]
 #[command(name = "nexus")]
@@ -21,6 +25,12 @@ enum Commands {
     /// Index a directory
     Index {
         path: String,
+        /// Maximum memory usage in MB (default: 75% of system RAM)
+        #[arg(long)]
+        max_memory_mb: Option<u64>,
+        /// Skip files larger than this size in MB (default: 50)
+        #[arg(long, default_value = "50")]
+        max_file_mb: u64,
     },
     /// Show indexer/search status
     Status,
@@ -46,11 +56,19 @@ impl TextExtractor for OcrExtractor {
     }
 }
 
-struct DummyEmbedder;
+/// Wrapper to adapt LocalEmbedder to nexus_core::Embedder trait.
+struct EmbedWrapper(LocalEmbedder);
+
 #[async_trait]
-impl Embedder for DummyEmbedder {
-    async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-        Ok(vec![0.0, 1.0, 2.0])
+impl Embedder for EmbedWrapper {
+    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        self.0.embed(text).await
+    }
+    async fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.0.embed_batch(texts).await
+    }
+    fn dimension(&self) -> usize {
+        self.0.dimension()
     }
 }
 
@@ -60,27 +78,166 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Index { path } => {
-            println!("Indexing directory: {}", path);
-            let options = IndexOptions { root: PathBuf::from(path) };
+        Commands::Index { path, max_memory_mb, max_file_mb } => {
+            // Get system memory info
+            let sys = System::new_all();
+            let total_mem_mb = sys.total_memory() / 1024 / 1024;
+            let max_mem = max_memory_mb.unwrap_or(total_mem_mb * 3 / 4);
+            
+            eprintln!("info: indexing {}", path);
+            eprintln!("info: memory limit {}MB (system: {}MB)\", max file: {}MB", 
+                max_mem, total_mem_mb, max_file_mb);
+
+            // Initialize data directory
+            let data_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("nexus_local");
+            std::fs::create_dir_all(&data_dir)?;
+
+            eprintln!("info: loading embedding model...");
+            let embedder = LocalEmbedder::new()?;
+            eprintln!("info: model loaded (dim={})", embedder.dimension());
+
+            eprintln!("info: opening store at {:?}", data_dir);
+            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+            eprintln!("info: {} existing embeddings", store.count().await);
+
+            let options = IndexOptions { 
+                root: PathBuf::from(&path), 
+                chunk_size: 512,
+                max_file_size_bytes: max_file_mb * 1024 * 1024,
+                max_memory_bytes: max_mem * 1024 * 1024,
+            };
             let extractor = OcrExtractor(PlainTextExtractor);
-            let embedder = DummyEmbedder;
-            let mut indexer = Indexer::new(options, extractor, embedder);
-            let mut events = Vec::new();
+            let embedder = EmbedWrapper(embedder);
+            let mut indexer = Indexer::new(options, extractor, embedder, store.clone());
+
             let result = indexer.run_with_progress(|e| {
-                println!("Event: {:?}", e);
-                events.push(e);
+                match &e {
+                    IndexEvent::FileStarted(p) => eprintln!("  processing {}", p.display()),
+                    IndexEvent::FileIndexed(p) => eprintln!("  indexed {}", p.display()),
+                    IndexEvent::FileSkipped(p, reason) => eprintln!("  skipped {} ({})", p.display(), reason),
+                    IndexEvent::ChunkEmbedded(_, i, id) => eprintln!("    chunk {} -> {}", i, &id[..8]),
+                    IndexEvent::FileError(p, err) => eprintln!("  error: {} - {}", p.display(), err),
+                    IndexEvent::Done => {},
+                    _ => {}
+                }
             }).await?;
-            println!("Indexed {} files, {} chunks, {} errors", result.files_indexed, result.chunks_indexed, result.errors.len());
+
+            eprintln!("done: {} indexed, {} skipped, {} chunks, {} embeddings, {} errors",
+                result.files_indexed,
+                result.files_skipped,
+                result.chunks_indexed,
+                result.embeddings_stored,
+                result.errors.len()
+            );
+            eprintln!("info: total embeddings in store: {}", store.count().await);
         }
         Commands::Status => {
-            println!("Indexer/search status: (stub)");
+            // Initialize data directory
+            let data_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("nexus_local");
+
+            if !data_dir.exists() {
+                eprintln!("error: no index found, run 'nexus index <path>' first");
+                return Ok(());
+            }
+
+            let store = Arc::new(LocalVectorStore::new(data_dir.clone())?);
+            let count = store.count().await;
+            println!("nexus status");
+            println!("  store: {:?}", data_dir);
+            println!("  embeddings: {}", count);
         }
         Commands::Search { query, json } => {
-            println!("Searching for: {} (json: {})", query, json);
+            // Initialize data directory
+            let data_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("nexus_local");
+
+            if !data_dir.exists() {
+                eprintln!("error: no index found, run 'nexus index <path>' first");
+                return Ok(());
+            }
+
+            // Load embedder and store
+            let embedder = LocalEmbedder::new()?;
+            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+
+            // Embed the query
+            let query_embedding = embedder.embed(&query).await?;
+
+            // Search
+            let results = store.search(query_embedding, 5).await?;
+
+            if json {
+                // JSON output
+                let json_results: Vec<_> = results.iter().map(|r| {
+                    serde_json::json!({
+                        "doc_id": r.doc_id,
+                        "score": r.score,
+                        "file_path": r.metadata.file_path,
+                        "chunk_index": r.metadata.chunk_index,
+                        "snippet": r.snippet
+                    })
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&json_results)?);
+            } else {
+                // Human-readable output
+                println!("search: \"{}\"", query);
+
+                if results.is_empty() {
+                    println!("  (no results)");
+                } else {
+                    for (i, result) in results.iter().enumerate() {
+                        println!();
+                        println!("  {}. {} (score: {:.4})", 
+                            i + 1, 
+                            result.metadata.file_path.display(),
+                            result.score
+                        );
+                        println!("     chunk {} | id {}", 
+                            result.metadata.chunk_index, 
+                            &result.doc_id[..8]
+                        );
+                        if let Some(snippet) = &result.snippet {
+                            let preview: String = snippet.chars().take(80).collect();
+                            println!("     > {}...", preview.replace('\n', " "));
+                        }
+                    }
+                    println!();
+                }
+            }
         }
         Commands::Explain { doc_id } => {
-            println!("Explaining document: {}", doc_id);
+            // Initialize data directory
+            let data_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("nexus_local");
+
+            if !data_dir.exists() {
+                eprintln!("error: no index found, run 'nexus index <path>' first");
+                return Ok(());
+            }
+
+            let store = Arc::new(LocalVectorStore::new(data_dir)?);
+
+            // Find matching documents (partial ID match)
+            if let Some(metadata) = store.get_metadata(&doc_id).await? {
+                println!("document: {}", doc_id);
+                println!("  path: {}", metadata.file_path.display());
+                println!("  type: {}", metadata.file_type);
+                println!("  chunk: {}", metadata.chunk_index);
+                if let Some(snippet) = &metadata.snippet {
+                    println!("  content:");
+                    for line in snippet.lines() {
+                        println!("    {}", line);
+                    }
+                }
+            } else {
+                eprintln!("error: document not found: {}", doc_id);
+            }
         }
     }
     Ok(())
