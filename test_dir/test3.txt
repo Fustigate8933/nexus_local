@@ -1,1 +1,1 @@
-test file 3
+Test file number 3 with some content for testing parallel indexing

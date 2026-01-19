@@ -4,10 +4,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use anyhow::Result;
 use std::ffi::OsStr;
 use sysinfo::System;
+use rayon::prelude::*;
 pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileState};
 
 /// Options for configuring the indexer.
@@ -67,17 +69,18 @@ pub struct GcResult {
 }
 
 /// Main orchestrator for the indexing pipeline.
-pub struct Indexer<E: TextExtractor, M: Embedder, S: VectorStore> {
+/// Uses parallel text extraction with Rayon, followed by batched embedding.
+pub struct Indexer<E: SyncTextExtractor, M: Embedder, S: VectorStore> {
 	options: IndexOptions,
-	extractor: E,
+	extractor: Arc<E>,
 	embedder: M,
 	store: Arc<S>,
 	state: Option<Arc<StateManager>>,
 }
 
-impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
+impl<E: SyncTextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	pub fn new(options: IndexOptions, extractor: E, embedder: M, store: Arc<S>) -> Self {
-		Self { options, extractor, embedder, store, state: None }
+		Self { options, extractor: Arc::new(extractor), embedder, store, state: None }
 	}
 	
 	/// Set the state manager for incremental indexing.
@@ -126,127 +129,133 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 	}
 
 	/// Run the indexing pipeline, reporting progress via callback.
+	/// Uses parallel text extraction with Rayon for improved performance.
 	pub async fn run_with_progress<F>(&mut self, mut cb: F) -> Result<IndexResult>
 	where
 		F: FnMut(IndexEvent) + Send,
 	{
-		let mut files_indexed = 0;
-		let mut files_skipped = 0;
-		let mut files_unchanged = 0;
-		let mut chunks_indexed = 0;
-		let mut embeddings_stored = 0;
-		let mut errors = vec![];
-
 		let files = discover_files(&self.options.root)?;
 		let chunk_size = self.options.chunk_size;
 		let max_file_size = self.options.max_file_size_bytes;
 		let max_memory = self.options.max_memory_bytes;
 
-		// System info for memory monitoring
+		// Counters for skipped/unchanged (used in parallel phase)
+		let files_skipped = AtomicUsize::new(0);
+		let files_unchanged = AtomicUsize::new(0);
+
+		// Check memory before starting
 		let mut sys = System::new();
+		sys.refresh_memory();
+		let used_mem = sys.used_memory();
+		if used_mem > max_memory {
+			let used_mb = used_mem / 1024 / 1024;
+			let limit_mb = max_memory / 1024 / 1024;
+			cb(IndexEvent::MemoryPressure(used_mb, limit_mb));
+			// Continue anyway but warn - parallel extraction will proceed
+		}
 
-		// Process files sequentially to allow mutable borrow of embedder
-		for path in files {
-			// Memory throttling: skip file if memory usage exceeds limit
-			sys.refresh_memory();
-			let used_mem = sys.used_memory(); // bytes
-			if used_mem > max_memory {
-				let used_mb = used_mem / 1024 / 1024;
-				let limit_mb = max_memory / 1024 / 1024;
-				cb(IndexEvent::MemoryPressure(used_mb, limit_mb));
-				let reason = format!("memory pressure ({}MB > {}MB limit)", used_mb, limit_mb);
-				cb(IndexEvent::FileSkipped(path.clone(), reason));
-				files_skipped += 1;
-				continue;
-			}
-
-			// Check file size before processing
-			if let Ok(metadata) = std::fs::metadata(&path) {
-				if metadata.len() > max_file_size {
-					let reason = format!("file too large ({}MB > {}MB limit)", 
-						metadata.len() / 1024 / 1024,
-						max_file_size / 1024 / 1024);
-					cb(IndexEvent::FileSkipped(path.clone(), reason));
-					files_skipped += 1;
-					continue;
+		// Phase 1: Parallel text extraction with Rayon
+		// Each item: (path, chunks, file_type) or error
+		let extractor = self.extractor.clone();
+		let state = self.state.clone();
+		
+		let extraction_results: Vec<_> = files
+			.par_iter()
+			.filter_map(|path| {
+				// Check file size
+				if let Ok(metadata) = std::fs::metadata(path) {
+					if metadata.len() > max_file_size {
+						files_skipped.fetch_add(1, Ordering::Relaxed);
+						return None;
+					}
 				}
-			}
-			
-			// Check if file needs indexing (using state manager if available)
-			if let Some(ref state) = self.state {
-				match state.needs_indexing(&path) {
-					Ok(false) => {
-						cb(IndexEvent::FileUnchanged(path.clone()));
-						files_unchanged += 1;
+				
+				// Check if file needs indexing
+				if let Some(ref state) = state {
+					match state.needs_indexing(path) {
+						Ok(false) => {
+							files_unchanged.fetch_add(1, Ordering::Relaxed);
+							return None;
+						}
+						Ok(true) => {}
+						Err(_) => {} // Index anyway on error
+					}
+				}
+				
+				// Extract text (sync, CPU-bound)
+				match extractor.extract_text_sync(path) {
+					Ok(contents) => {
+						let chunks = chunk_text(&contents, chunk_size);
+						let file_type = path.extension()
+							.and_then(|e| e.to_str())
+							.unwrap_or("unknown")
+							.to_string();
+						Some(Ok((path.clone(), chunks, file_type)))
+					}
+					Err(e) => Some(Err((path.clone(), format!("{}", e))))
+				}
+			})
+			.collect();
+
+		// Phase 2: Sequential embedding and storage
+		let mut files_indexed = 0;
+		let mut chunks_indexed = 0;
+		let mut embeddings_stored = 0;
+		let mut errors: Vec<(PathBuf, String)> = vec![];
+
+		for result in extraction_results {
+			match result {
+				Ok((path, chunks, file_type)) => {
+					cb(IndexEvent::FileStarted(path.clone()));
+					
+					if chunks.is_empty() {
+						cb(IndexEvent::FileIndexed(path));
 						continue;
 					}
-					Ok(true) => {
-						// File needs indexing, continue
-					}
-					Err(e) => {
-						// State check failed, index anyway
-						eprintln!("  warning: state check failed for {}: {}", path.display(), e);
-					}
-				}
-			}
 
-			cb(IndexEvent::FileStarted(path.clone()));
-
-			match self.extractor.extract_text(&path).await {
-				Ok(contents) => {
-					let chunks = chunk_text(&contents, chunk_size);
 					let mut file_doc_ids: Vec<String> = Vec::new();
+					let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+					
+					match self.embedder.embed_batch(&chunk_refs).await {
+						Ok(embeddings) => {
+							for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.into_iter()).enumerate() {
+								chunks_indexed += 1;
+								cb(IndexEvent::ChunkProcessed(path.clone(), i));
 
-					// Batch embed for efficiency
-					if !chunks.is_empty() {
-						let chunk_refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
-						match self.embedder.embed_batch(&chunk_refs).await {
-							Ok(embeddings) => {
-								for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.into_iter()).enumerate() {
-									chunks_indexed += 1;
-									cb(IndexEvent::ChunkProcessed(path.clone(), i));
+								// Safe truncation for UTF-8 strings
+								let snippet = if chunk.chars().count() > 200 {
+									let truncated: String = chunk.chars().take(200).collect();
+									Some(format!("{}...", truncated))
+								} else {
+									Some(chunk.clone())
+								};
 
-									// Store embedding with metadata
-									let file_type = path.extension()
-										.and_then(|e| e.to_str())
-										.unwrap_or("unknown")
-										.to_string();
+								let metadata = DocumentMetadata {
+									doc_id: String::new(),
+									file_path: path.clone(),
+									file_type: file_type.clone(),
+									chunk_index: i,
+									snippet,
+								};
 
-									// Safe truncation for UTF-8 strings
-									let snippet = if chunk.chars().count() > 200 {
-										let truncated: String = chunk.chars().take(200).collect();
-										Some(format!("{}...", truncated))
-									} else {
-										Some(chunk.clone())
-									};
-
-									let metadata = DocumentMetadata {
-										doc_id: String::new(), // Will be assigned by store
-										file_path: path.clone(),
-										file_type,
-										chunk_index: i,
-										snippet,
-									};
-
-									match self.store.add_embedding(embedding, metadata).await {
-										Ok(doc_id) => {
-											embeddings_stored += 1;
-											file_doc_ids.push(doc_id.clone());
-											cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id));
-										}
-										Err(e) => {
-											let err_str = format!("Failed to store embedding: {}", e);
-											cb(IndexEvent::FileError(path.clone(), err_str.clone()));
-											errors.push((path.clone(), err_str));
-										}
+								match self.store.add_embedding(embedding, metadata).await {
+									Ok(doc_id) => {
+										embeddings_stored += 1;
+										file_doc_ids.push(doc_id.clone());
+										cb(IndexEvent::ChunkEmbedded(path.clone(), i, doc_id));
+									}
+									Err(e) => {
+										let err_str = format!("Failed to store embedding: {}", e);
+										cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+										errors.push((path.clone(), err_str));
 									}
 								}
 							}
-							Err(e) => {
-								let err_str = format!("Embedding failed: {}", e);
-								cb(IndexEvent::FileError(path.clone(), err_str.clone()));
-								errors.push((path.clone(), err_str));
-							}
+						}
+						Err(e) => {
+							let err_str = format!("Embedding failed: {}", e);
+							cb(IndexEvent::FileError(path.clone(), err_str.clone()));
+							errors.push((path.clone(), err_str));
 						}
 					}
 					
@@ -266,8 +275,7 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 					
 					cb(IndexEvent::FileIndexed(path));
 				}
-				Err(ref e) => {
-					let err_str = format!("{}", e);
+				Err((path, err_str)) => {
 					cb(IndexEvent::FileError(path.clone(), err_str.clone()));
 					errors.push((path, err_str));
 				}
@@ -280,8 +288,8 @@ impl<E: TextExtractor, M: Embedder, S: VectorStore> Indexer<E, M, S> {
 		cb(IndexEvent::Done);
 		Ok(IndexResult {
 			files_indexed,
-			files_skipped,
-			files_unchanged,
+			files_skipped: files_skipped.load(Ordering::Relaxed),
+			files_unchanged: files_unchanged.load(Ordering::Relaxed),
 			chunks_indexed,
 			embeddings_stored,
 			errors,
@@ -330,6 +338,11 @@ fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
 #[async_trait]
 pub trait TextExtractor: Send + Sync {
 	async fn extract_text(&self, path: &PathBuf) -> Result<String>;
+}
+
+/// Sync version of TextExtractor for parallel processing with Rayon.
+pub trait SyncTextExtractor: Send + Sync {
+	fn extract_text_sync(&self, path: &PathBuf) -> Result<String>;
 }
 
 /// Trait for generating embeddings from text.

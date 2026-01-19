@@ -3,8 +3,8 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, TextExtractor, VectorStore};
-use ocr::{PlainTextExtractor, OcrEngine};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore};
+use ocr::{PlainTextExtractor, SyncOcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
 use store::{LanceVectorStore, StateManager};
 use std::path::PathBuf;
@@ -46,13 +46,12 @@ enum Commands {
     },
 }
 
-/// Wrapper to adapt PlainTextExtractor (OcrEngine) to TextExtractor trait.
+/// Wrapper to adapt PlainTextExtractor (SyncOcrEngine) to SyncTextExtractor trait.
 struct OcrExtractor(PlainTextExtractor);
 
-#[async_trait]
-impl TextExtractor for OcrExtractor {
-    async fn extract_text(&self, path: &PathBuf) -> anyhow::Result<String> {
-        self.0.extract_text(path).await
+impl SyncTextExtractor for OcrExtractor {
+    fn extract_text_sync(&self, path: &PathBuf) -> anyhow::Result<String> {
+        self.0.extract_text_sync(path)
     }
 }
 

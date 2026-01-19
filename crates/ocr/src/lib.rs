@@ -23,6 +23,11 @@ pub trait OcrEngine: Send + Sync {
     async fn extract_text(&self, path: &PathBuf) -> Result<String>;
 }
 
+/// Sync trait for parallel text extraction with Rayon.
+pub trait SyncOcrEngine: Send + Sync {
+    fn extract_text_sync(&self, path: &PathBuf) -> Result<String>;
+}
+
 /// Preprocesses an image: loads it, resizes if needed, saves to temp file.
 /// Returns the path to use for OCR (either original or temp file).
 fn preprocess_image(path: &PathBuf) -> Result<(PathBuf, Option<NamedTempFile>)> {
@@ -60,9 +65,9 @@ fn preprocess_image(path: &PathBuf) -> Result<(PathBuf, Option<NamedTempFile>)> 
 /// Implementation for extracting text from various file types.
 pub struct PlainTextExtractor;
 
-#[async_trait]
-impl OcrEngine for PlainTextExtractor {
-    async fn extract_text(&self, path: &PathBuf) -> Result<String> {
+impl PlainTextExtractor {
+    /// Core sync extraction logic, used by both async and sync traits.
+    fn do_extract(&self, path: &PathBuf) -> Result<String> {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         match ext.as_str() {
             "txt" | "md" => {
@@ -96,6 +101,19 @@ impl OcrEngine for PlainTextExtractor {
             }
             _ => Ok(String::new()),
         }
+    }
+}
+
+#[async_trait]
+impl OcrEngine for PlainTextExtractor {
+    async fn extract_text(&self, path: &PathBuf) -> Result<String> {
+        self.do_extract(path)
+    }
+}
+
+impl SyncOcrEngine for PlainTextExtractor {
+    fn extract_text_sync(&self, path: &PathBuf) -> Result<String> {
+        self.do_extract(path)
     }
 }
 
