@@ -6,7 +6,6 @@ members = [
     "crates/embed",
     "crates/store",
     "crates/search",
-    "crates/cli"
+    "crates/cli",
+    "ui/src-tauri"
 ]
-
-# TODO: Add common workspace dependencies here (tokio, anyhow, thiserror, etc.)

@@ -14,6 +14,15 @@ pub use store::{VectorStore, DocumentMetadata, SearchResult, StateManager, FileS
 // Re-export paged extraction types from ocr crate
 pub use ocr::{ExtractedPage, PagedExtractor};
 
+// Configuration, watch mode, and service modules
+pub mod config;
+pub mod watch;
+pub mod service;
+
+pub use config::NexusConfig;
+pub use watch::{FileWatcher, ChangeBatch};
+pub use service::ServiceManager;
+
 /// Options for configuring the indexer.
 pub struct IndexOptions {
 	pub root: PathBuf,

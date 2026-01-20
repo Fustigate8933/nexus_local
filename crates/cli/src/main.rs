@@ -3,7 +3,7 @@
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore, PagedExtractor, ExtractedPage, LexicalIndex};
+use nexus_core::{IndexOptions, Indexer, Embedder, IndexEvent, SyncTextExtractor, VectorStore, PagedExtractor, ExtractedPage, LexicalIndex, NexusConfig, FileWatcher, ServiceManager};
 use ocr::{PlainTextExtractor, SyncOcrEngine};
 use embed::{LocalEmbedder, Embedder as EmbedderTrait};
 use store::{LanceVectorStore, StateManager};
@@ -75,6 +75,45 @@ enum Commands {
     Explain {
         doc_id: String,
     },
+    /// Watch directories for changes and auto-index
+    Watch {
+        /// Override config roots with specific paths
+        paths: Vec<String>,
+    },
+    /// Generate or show configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Manage background service
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Generate a default config file
+    Init {
+        /// Output path (default: ~/.config/nexus/nexus.config.toml)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Show current config location and values
+    Show,
+    /// Show the default config file path
+    Path,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the background service for auto-start
+    Install,
+    /// Uninstall the background service
+    Uninstall,
+    /// Show service status
+    Status,
 }
 
 /// Wrapper to adapt PlainTextExtractor (SyncOcrEngine) to SyncTextExtractor trait.
@@ -424,6 +463,167 @@ async fn main() -> Result<()> {
                 }
             } else {
                 eprintln!("error: document not found: {}", doc_id);
+            }
+        }
+        Commands::Watch { paths } => {
+            let config = NexusConfig::load()?;
+            
+            // Use CLI paths or config roots
+            let roots: Vec<PathBuf> = if paths.is_empty() {
+                config.index.roots.clone()
+            } else {
+                paths.iter().map(|p| {
+                    let expanded = shellexpand::tilde(p);
+                    PathBuf::from(expanded.as_ref())
+                }).collect()
+            };
+
+            if roots.is_empty() {
+                eprintln!("error: no directories to watch");
+                eprintln!("hint: provide paths or set 'index.roots' in nexus.config.toml");
+                return Ok(());
+            }
+
+            eprintln!("nexus watch mode");
+            eprintln!("  debounce: {}s", config.watch.debounce_secs);
+            eprintln!("  ignore: {:?}", config.watch.ignore_patterns);
+            
+            let mut watcher = FileWatcher::new(config.watch.clone())?;
+            
+            for root in &roots {
+                if root.exists() {
+                    watcher.watch(root)?;
+                } else {
+                    eprintln!("  warning: {} does not exist, skipping", root.display());
+                }
+            }
+
+            eprintln!("watching for changes (Ctrl+C to stop)...\n");
+
+            // Initialize indexing components once
+            let data_dir = config.data_dir();
+            std::fs::create_dir_all(&data_dir)?;
+            
+            let embedder = LocalEmbedder::new_with_options(config.gpu.enabled)?;
+            let store = Arc::new(LanceVectorStore::new(data_dir.clone()).await?);
+            let state = Arc::new(StateManager::new(&data_dir)?);
+            let lexical = Arc::new(LexicalIndex::new(data_dir.clone())?);
+
+            loop {
+                let batch = watcher.wait_for_changes()?;
+                
+                if !batch.deleted.is_empty() {
+                    eprintln!("  deleted: {} files", batch.deleted.len());
+                    // TODO: Remove from index
+                }
+                
+                if !batch.modified.is_empty() {
+                    eprintln!("  changed: {} files", batch.modified.len());
+                    
+                    // Re-index modified files
+                    for path in &batch.modified {
+                        eprintln!("    indexing: {}", path.display());
+                        
+                        // Find which root this file belongs to
+                        let root = roots.iter()
+                            .find(|r| path.starts_with(r))
+                            .cloned()
+                            .unwrap_or_else(|| path.parent().unwrap_or(path).to_path_buf());
+                        
+                        let options = IndexOptions {
+                            root,
+                            chunk_size: 1500,
+                            max_file_size_bytes: config.index.max_file_mb * 1024 * 1024,
+                            max_memory_bytes: 4 * 1024 * 1024 * 1024,
+                            max_chunks_per_file: config.index.max_chunks,
+                            skip_extensions: config.index.skip_extensions.clone(),
+                            skip_files: config.index.skip_files.clone(),
+                        };
+                        
+                        let extractor = OcrExtractor(PlainTextExtractor);
+                        let embed_wrapper = EmbedWrapper(LocalEmbedder::new_with_options(config.gpu.enabled)?);
+                        
+                        let indexer = Indexer::new(options, extractor, embed_wrapper, store.clone())
+                            .with_state(state.clone())
+                            .with_lexical(lexical.clone());
+                        
+                        // TODO: Index single file instead of full directory scan
+                        // For now, run GC + full index which will pick up changes
+                        let mut indexer = indexer;
+                        let _ = indexer.run_with_progress(|_| {}).await;
+                    }
+                    
+                    eprintln!("  done\n");
+                }
+            }
+        }
+        Commands::Config { action } => {
+            match action {
+                ConfigAction::Init { output } => {
+                    let path = output.unwrap_or_else(|| {
+                        NexusConfig::default_config_path()
+                            .unwrap_or_else(|| PathBuf::from("nexus.config.toml"))
+                    });
+                    
+                    if path.exists() {
+                        eprintln!("error: config already exists at {}", path.display());
+                        eprintln!("hint: delete it first or use --output to specify a different path");
+                        return Ok(());
+                    }
+                    
+                    let content = NexusConfig::generate_default_config();
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, content)?;
+                    
+                    println!("Created config file: {}", path.display());
+                    println!("\nEdit this file to configure:");
+                    println!("  - Directories to index (index.roots)");
+                    println!("  - File types to skip");
+                    println!("  - GPU acceleration");
+                    println!("  - Watch mode settings");
+                }
+                ConfigAction::Show => {
+                    if let Some(path) = NexusConfig::find_config_file() {
+                        println!("Config file: {}\n", path.display());
+                        let content = std::fs::read_to_string(&path)?;
+                        println!("{}", content);
+                    } else {
+                        println!("No config file found.");
+                        println!("\nSearched locations:");
+                        println!("  1. ./nexus.config.toml");
+                        if let Some(p) = NexusConfig::default_config_path() {
+                            println!("  2. {}", p.display());
+                        }
+                        println!("\nRun 'nexus config init' to create one.");
+                    }
+                }
+                ConfigAction::Path => {
+                    if let Some(path) = NexusConfig::find_config_file() {
+                        println!("{}", path.display());
+                    } else if let Some(default) = NexusConfig::default_config_path() {
+                        println!("{} (does not exist)", default.display());
+                    }
+                }
+            }
+        }
+        Commands::Service { action } => {
+            let manager = ServiceManager::new()?;
+            
+            match action {
+                ServiceAction::Install => {
+                    let result = manager.install()?;
+                    println!("{}", result);
+                }
+                ServiceAction::Uninstall => {
+                    let result = manager.uninstall()?;
+                    println!("{}", result);
+                }
+                ServiceAction::Status => {
+                    let result = manager.status()?;
+                    println!("{}", result);
+                }
             }
         }
     }
