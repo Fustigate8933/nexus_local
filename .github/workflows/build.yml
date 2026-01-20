@@ -1,0 +1,131 @@
+name: Build Tauri App
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-linux:
+    name: Linux Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: actions/setup-rust@v1
+        with:
+          rust-toolchain: stable
+
+      - name: Install PNPM
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: |
+          cd ui
+          pnpm install
+
+      - name: Build frontend
+        run: |
+          cd ui
+          pnpm build
+
+      - name: Build Tauri App (Linux only, skip AppImage)
+        run: |
+          cd ui
+          npx tauri build --bundles deb,rpm
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-bundles
+          path: ui/src-tauri/target/release/bundle/**
+
+  build-windows:
+    name: Windows Build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: actions/setup-rust@v1
+        with:
+          rust-toolchain: stable
+
+      - name: Install PNPM
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: |
+          cd ui
+          pnpm install
+
+      - name: Build frontend
+        run: |
+          cd ui
+          pnpm build
+
+      - name: Build Tauri App (Windows)
+        run: |
+          cd ui
+          npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-bundles
+          path: ui/src-tauri/target/release/bundle/**
+
+  build-macos:
+    name: macOS Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: actions/setup-rust@v1
+        with:
+          rust-toolchain: stable
+
+      - name: Install PNPM
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: |
+          cd ui
+          pnpm install
+
+      - name: Build frontend
+        run: |
+          cd ui
+          pnpm build
+
+      - name: Build Tauri App (macOS)
+        run: |
+          cd ui
+          npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: macos-bundles
+          path: ui/src-tauri/target/release/bundle/**
+
