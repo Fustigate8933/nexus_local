@@ -41,7 +41,8 @@ jobs:
           librsvg2-dev \
           curl \
           build-essential \
-          protobuf-compiler
+          protobuf-compiler \
+          libleptonica-dev
 
       - name: Install frontend dependencies
         run: |
@@ -90,6 +91,9 @@ jobs:
           cd ui
           pnpm install
 
+      - name: Install protobuf compiler
+        run: choco install protobuf
+
       - name: Build frontend
         run: |
           cd ui
@@ -131,6 +135,9 @@ jobs:
         run: |
           cd ui
           pnpm install
+
+      - name: Install protobuf compiler
+        run: brew install protobuf
 
       - name: Build frontend
         run: |
