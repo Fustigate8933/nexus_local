@@ -10,7 +10,6 @@ on:
 
 jobs:
   build-linux:
-    name: Linux Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -30,6 +29,16 @@ jobs:
       - name: Install PNPM
         run: npm install -g pnpm
 
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+          libglib2.0-dev \
+          pkg-config \
+          libgtk-3-dev \
+          libwebkit2gtk-4.0-dev \
+          curl build-essential
+
       - name: Install frontend dependencies
         run: |
           cd ui
@@ -40,7 +49,7 @@ jobs:
           cd ui
           pnpm build
 
-      - name: Build Tauri App (Linux only, skip AppImage)
+      - name: Build Tauri App (Linux)
         run: |
           cd ui
           pnpm tauri build
