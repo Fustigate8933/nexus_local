@@ -92,7 +92,7 @@ jobs:
           pnpm install
 
       - name: Install protobuf compiler
-        run: choco install protobuf
+        run: choco install protoc -y
 
       - name: Build frontend
         run: |
