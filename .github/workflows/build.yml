@@ -21,9 +21,11 @@ jobs:
           node-version: 20
 
       - name: Setup Rust
-        uses: rust-lang/setup-rust@v2
+        uses: actions-rs/toolchain@v1
         with:
+          profile: minimal
           toolchain: stable
+          override: true
 
       - name: Install PNPM
         run: npm install -g pnpm
@@ -38,10 +40,10 @@ jobs:
           cd ui
           pnpm build
 
-      - name: Build Tauri App (Linux, skip AppImage)
+      - name: Build Tauri App (Linux only, skip AppImage)
         run: |
           cd ui
-          npx tauri build --bundles deb,rpm
+          pnpm tauri build -- --bundles deb,rpm
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -61,9 +63,11 @@ jobs:
           node-version: 20
 
       - name: Setup Rust
-        uses: rust-lang/setup-rust@v2
+        uses: actions-rs/toolchain@v1
         with:
+          profile: minimal
           toolchain: stable
+          override: true
 
       - name: Install PNPM
         run: npm install -g pnpm
@@ -81,7 +85,7 @@ jobs:
       - name: Build Tauri App (Windows)
         run: |
           cd ui
-          npx tauri build
+          pnpm tauri build
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -101,9 +105,11 @@ jobs:
           node-version: 20
 
       - name: Setup Rust
-        uses: rust-lang/setup-rust@v2
+        uses: actions-rs/toolchain@v1
         with:
+          profile: minimal
           toolchain: stable
+          override: true
 
       - name: Install PNPM
         run: npm install -g pnpm
@@ -121,7 +127,7 @@ jobs:
       - name: Build Tauri App (macOS)
         run: |
           cd ui
-          npx tauri build
+          pnpm tauri build
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
