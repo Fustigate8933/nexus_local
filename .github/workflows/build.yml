@@ -8,23 +8,27 @@ on:
     branches:
       - main
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          workspaces: ui/src-tauri
 
       - name: Install PNPM
         run: npm install -g pnpm
@@ -33,16 +37,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-          libglib2.0-dev \
-          pkg-config \
-          libgtk-3-dev \
-          libwebkit2gtk-4.1-dev \
-          libayatana-appindicator3-dev \
-          librsvg2-dev \
-          curl \
-          build-essential \
-          protobuf-compiler \
-          libleptonica-dev
+            libglib2.0-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            curl \
+            build-essential \
+            protobuf-compiler \
+            libleptonica-dev \
+            tesseract-ocr \
+            libtesseract-dev \
+            libpoppler-glib-dev \
+            libclang-dev \
+            clang
 
       - name: Install frontend dependencies
         run: |
@@ -69,30 +78,46 @@ jobs:
     name: Windows Build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          workspaces: ui/src-tauri
 
       - name: Install PNPM
         run: npm install -g pnpm
+
+      - name: Install Windows system dependencies
+        run: |
+          choco install protoc -y
+          choco install llvm -y
+          vcpkg integrate install
+          vcpkg install tesseract:x64-windows
+          vcpkg install leptonica:x64-windows
+          vcpkg install poppler:x64-windows
+        shell: powershell
+
+      - name: Set environment variables for vcpkg
+        run: |
+          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "C:\vcpkg\installed\x64-windows\bin" >> $env:GITHUB_PATH
+          echo "C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_PATH
+        shell: powershell
 
       - name: Install frontend dependencies
         run: |
           cd ui
           pnpm install
-
-      - name: Install protobuf compiler
-        run: choco install protoc -y
 
       - name: Build frontend
         run: |
@@ -100,6 +125,11 @@ jobs:
           pnpm build
 
       - name: Build Tauri App (Windows)
+        env:
+          TESSERACT_LIB_DIR: C:\vcpkg\installed\x64-windows\lib
+          TESSERACT_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
+          LEPTONICA_LIB_DIR: C:\vcpkg\installed\x64-windows\lib
+          LEPTONICA_INCLUDE_DIR: C:\vcpkg\installed\x64-windows\include
         run: |
           cd ui
           pnpm tauri build
@@ -114,30 +144,32 @@ jobs:
     name: macOS Build
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          workspaces: ui/src-tauri
 
       - name: Install PNPM
         run: npm install -g pnpm
+
+      - name: Install macOS system dependencies
+        run: |
+          brew install protobuf tesseract leptonica poppler pkg-config
 
       - name: Install frontend dependencies
         run: |
           cd ui
           pnpm install
-
-      - name: Install protobuf compiler
-        run: brew install protobuf
 
       - name: Build frontend
         run: |
