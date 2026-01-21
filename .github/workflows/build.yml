@@ -110,7 +110,9 @@ jobs:
         run: |
           choco install protoc -y
           choco install llvm -y
+          choco install pkgconfiglite -y
           vcpkg integrate install
+          vcpkg install glib:x64-windows-static-md
           vcpkg install tesseract:x64-windows-static-md
           vcpkg install leptonica:x64-windows-static-md
           vcpkg install poppler:x64-windows-static-md
@@ -123,6 +125,7 @@ jobs:
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows-static-md\lib\pkgconfig" >> $env:GITHUB_ENV
           echo "C:\vcpkg\installed\x64-windows-static-md\bin" >> $env:GITHUB_PATH
           echo "C:\vcpkg\installed\x64-windows-static-md\lib" >> $env:GITHUB_PATH
+          echo "C:\ProgramData\chocolatey\lib\pkgconfiglite\tools\pkg-config-lite-0.28-1\bin" >> $env:GITHUB_PATH
         shell: powershell
 
       - name: Install frontend dependencies
